@@ -33,7 +33,7 @@ static void ghost_fatal_error_dialog(const char *msg)
 
     NSAlert *alert = [[NSAlert alloc] init];
 
-    alert.messageText = @"Blender";
+    alert.messageText = @"Film Studio Engine F0";
     alert.informativeText = message;
     alert.alertStyle = NSAlertStyleCritical;
 

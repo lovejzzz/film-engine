@@ -452,32 +452,9 @@ static ui::Block *wm_block_about_create(bContext *C, ARegion *region, void * /*a
                                         0,
                                         style);
 
-/* Blender logo. */
-#ifndef WITH_HEADLESS
-  constexpr bool show_color = false;
-  const float size = 0.2f * dialog_width;
-
-  ImBuf *ibuf = ui::svg_icon_bitmap(ICON_BLENDER_LOGO_LARGE, size, show_color);
-
-  if (ibuf) {
-    bTheme *btheme = ui::theme::theme_get();
-    const uchar *color = btheme->tui.wcol_menu_back.text_sel;
-
-    /* The top margin. */
-    layout.row(false).separator(0.2f);
-
-    /* The logo image. */
-    layout.row(false).alignment_set(ui::LayoutAlign::Left);
-    uiDefButImage(block, ibuf, 0, U.widget_unit, ibuf->x, ibuf->y, show_color ? nullptr : color);
-
-    /* Padding below the logo. */
-    layout.row(false).separator(2.7f);
-  }
-#endif /* !WITH_HEADLESS */
-
   ui::Layout &col = layout.column(true);
 
-  uiItemL_ex(&col, IFACE_("Blender"), ICON_NONE, true, false);
+  uiItemL_ex(&col, IFACE_("Film Studio Engine F0"), ICON_NONE, true, false);
 
   MenuType *mt = WM_menutype_find("WM_MT_splash_about", true);
   if (mt) {
@@ -500,9 +477,9 @@ static wmOperatorStatus wm_splash_about_invoke(bContext *C,
 
 void WM_OT_splash_about(wmOperatorType *ot)
 {
-  ot->name = "About Blender";
+  ot->name = "About Film Studio Engine F0";
   ot->idname = "WM_OT_splash_about";
-  ot->description = "Open a window with information about Blender";
+  ot->description = "Open a window with information about Film Studio Engine F0";
 
   ot->invoke = wm_splash_about_invoke;
   ot->poll = WM_operator_winactive;

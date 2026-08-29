@@ -17,6 +17,7 @@
 
 static const char *GetApplicationSupportDir(const char *versionstr,
                                             const NSSearchPathDomainMask mask,
+                                            const char *applicationName,
                                             char *tempPath,
                                             const std::size_t len_tempPath)
 {
@@ -30,8 +31,9 @@ static const char *GetApplicationSupportDir(const char *versionstr,
 
     snprintf(tempPath,
              len_tempPath,
-             "%s/Blender/%s",
+             "%s/%s/%s",
              [basePath cStringUsingEncoding:NSASCIIStringEncoding],
+             applicationName,
              versionstr);
   }
   return tempPath;
@@ -40,13 +42,15 @@ static const char *GetApplicationSupportDir(const char *versionstr,
 const char *GHOST_SystemPathsCocoa::getSystemDir(int /* version */, const char *versionstr) const
 {
   static char tempPath[512] = "";
-  return GetApplicationSupportDir(versionstr, NSLocalDomainMask, tempPath, sizeof(tempPath));
+  return GetApplicationSupportDir(
+      versionstr, NSLocalDomainMask, "Blender", tempPath, sizeof(tempPath));
 }
 
 const char *GHOST_SystemPathsCocoa::getUserDir(int /* version */, const char *versionstr) const
 {
   static char tempPath[512] = "";
-  return GetApplicationSupportDir(versionstr, NSUserDomainMask, tempPath, sizeof(tempPath));
+  return GetApplicationSupportDir(
+      versionstr, NSUserDomainMask, "FilmStudioEngineF0", tempPath, sizeof(tempPath));
 }
 
 std::optional<std::string> GHOST_SystemPathsCocoa::getUserSpecialDir(

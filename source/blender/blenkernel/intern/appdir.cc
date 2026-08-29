@@ -225,7 +225,7 @@ void BKE_appdir_folder_caches(char *path, const size_t path_maxncpy)
                 "Cache",
                 SEP_STR);
 #elif defined(__APPLE__)
-  BLI_path_join(path, path_maxncpy, caches_root_path->c_str(), "Blender", SEP_STR);
+  BLI_path_join(path, path_maxncpy, caches_root_path->c_str(), "FilmStudioEngineF0", SEP_STR);
 #else /* __linux__ */
   BLI_path_join(path, path_maxncpy, caches_root_path->c_str(), "blender", SEP_STR);
 #endif
