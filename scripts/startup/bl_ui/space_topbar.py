@@ -44,6 +44,7 @@ class TOPBAR_HT_upper_bar(Header):
                 text="Select Shot" if shot else "Create Shot",
                 icon='RESTRICT_SELECT_OFF' if shot else 'ADD',
             )
+            layout.popover(panel="TOPBAR_PT_film_contract", text="Contract", icon='FILE_TICK')
             mode = layout.operator("film_studio.set_mode", text="Expert Mode", icon='WORKSPACE')
             mode.mode = 'EXPERT'
             return
@@ -109,6 +110,38 @@ class TOPBAR_PT_tool_settings_extra(Panel):
 
         # Draw the extra settings
         item.draw_settings(context, layout, tool, extra=True)
+
+
+class TOPBAR_PT_film_contract(Panel):
+    bl_idname = "TOPBAR_PT_film_contract"
+    bl_label = "Typed Scene Contract"
+    bl_space_type = 'TOPBAR'
+    bl_region_type = 'HEADER'
+    bl_ui_units_x = 28
+
+    def draw(self, context):
+        layout = self.layout
+        state = context.scene.film_studio
+
+        layout.prop(state, "contract_repository_root")
+        layout.prop(state, "contract_proposal_uri")
+        layout.prop(state, "contract_approval_uri")
+        layout.operator("film_studio.inspect_contract", icon='VIEWZOOM')
+
+        status = layout.box()
+        status.label(text=f"Status: {state.contract_status}")
+        if state.contract_proposal_id:
+            status.label(text=f"Proposal: {state.contract_proposal_id}")
+            status.label(text=f"Diff: {state.contract_diff_summary}")
+            status.label(text=f"Approved: {state.contract_approval_scope}")
+            status.label(text="Scene mutation: NOT APPROVED", icon='LOCKED')
+            status.label(text="Python / shell / network: NOT APPROVED", icon='LOCKED')
+            status.label(text=f"Output: {state.contract_output_uri}")
+            status.label(text=f"Plan: {state.contract_plan_hash}")
+
+        execute = layout.row()
+        execute.enabled = state.contract_status == "APPROVED_READY" and bool(state.contract_inspection_token)
+        execute.operator("film_studio.execute_contract", icon='CHECKMARK')
 
 
 class TOPBAR_PT_tool_fallback(Panel):
@@ -912,6 +945,7 @@ classes = (
     TOPBAR_MT_help,
     TOPBAR_PT_tool_fallback,
     TOPBAR_PT_tool_settings_extra,
+    TOPBAR_PT_film_contract,
     TOPBAR_PT_gpencil_primitive,
     TOPBAR_PT_name,
     TOPBAR_PT_name_marker,

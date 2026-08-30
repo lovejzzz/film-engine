@@ -2,9 +2,10 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-"""Minimal typed film workspace state for the F0.3 feasibility gate."""
+"""Typed film workspace and bounded SceneSpec contract bridge."""
 
 import bpy
+import film_studio_contract
 
 from bpy.props import (
     BoolProperty,
@@ -59,6 +60,16 @@ class FilmStudioWorkspaceState(PropertyGroup):
     shots: CollectionProperty(type=FilmStudioShotState)
     active_shot_index: IntProperty(name="Active Shot", default=-1, min=-1)
     expert_mode: BoolProperty(name="Expert Mode", default=False)
+    contract_repository_root: StringProperty(name="Repository Root", subtype='DIR_PATH')
+    contract_proposal_uri: StringProperty(name="Proposal URI")
+    contract_approval_uri: StringProperty(name="Approval URI")
+    contract_status: StringProperty(name="Contract Status", default="NOT_INSPECTED")
+    contract_proposal_id: StringProperty(name="Proposal ID")
+    contract_diff_summary: StringProperty(name="Proposal Diff")
+    contract_approval_scope: StringProperty(name="Approval Scope")
+    contract_output_uri: StringProperty(name="Approved Output")
+    contract_plan_hash: StringProperty(name="Plan Hash")
+    contract_inspection_token: StringProperty(name="Inspection Token", options={'HIDDEN'})
 
 
 def active_shot(state):
@@ -137,6 +148,72 @@ class FILMSTUDIO_OT_set_mode(Operator):
         return {'FINISHED'}
 
 
+class FILMSTUDIO_OT_inspect_contract(Operator):
+    bl_idname = "film_studio.inspect_contract"
+    bl_label = "Inspect Proposal and Approval"
+    bl_description = "Validate and display the typed proposal diff and exact approval scope without writing or changing the scene"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        state = context.scene.film_studio
+        state.contract_inspection_token = ""
+        try:
+            result = film_studio_contract.inspect_proposal(
+                bpy.path.abspath(state.contract_repository_root),
+                state.contract_proposal_uri,
+                state.contract_approval_uri,
+            )
+        except film_studio_contract.ContractError as error:
+            state.contract_status = f"REJECTED: {error.reason}"
+            state.contract_proposal_id = ""
+            state.contract_diff_summary = ""
+            state.contract_approval_scope = ""
+            state.contract_output_uri = ""
+            state.contract_plan_hash = ""
+            self.report({'ERROR'}, f"{error.reason}: {error}")
+            return {'CANCELLED'}
+        state.contract_status = result["status"]
+        state.contract_proposal_id = result["proposalId"]
+        state.contract_diff_summary = "none -> one immutable BuildPlan"
+        state.contract_approval_scope = f"{result['approvedOperation']} / {', '.join(result['approvedMutationScope'])} only"
+        state.contract_output_uri = result["outputUri"]
+        state.contract_plan_hash = result["planHash"]
+        state.contract_inspection_token = result["inspectionToken"]
+        self.report({'INFO'}, "Proposal diff and approval scope inspected; no scene mutation")
+        return {'FINISHED'}
+
+
+class FILMSTUDIO_OT_execute_contract(Operator):
+    bl_idname = "film_studio.execute_contract"
+    bl_label = "Execute Approved Compile"
+    bl_description = "Write only the approved immutable BuildPlan after a successful inspection"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        state = getattr(context.scene, "film_studio", None)
+        return bool(state and state.contract_status == "APPROVED_READY" and state.contract_inspection_token)
+
+    def execute(self, context):
+        state = context.scene.film_studio
+        try:
+            result = film_studio_contract.execute_approved_compile(
+                bpy.path.abspath(state.contract_repository_root),
+                state.contract_proposal_uri,
+                state.contract_approval_uri,
+                state.contract_inspection_token,
+            )
+        except film_studio_contract.ContractError as error:
+            state.contract_status = f"REJECTED: {error.reason}"
+            state.contract_inspection_token = ""
+            self.report({'ERROR'}, f"{error.reason}: {error}")
+            return {'CANCELLED'}
+        state.contract_status = result["status"]
+        state.contract_inspection_token = ""
+        self.report({'INFO'}, f"BuildPlan written: {result['fileSha256'][:12]}")
+        return {'FINISHED'}
+
+
 classes = (
     FilmStudioProjectState,
     FilmStudioSceneState,
@@ -145,6 +222,8 @@ classes = (
     FilmStudioWorkspaceState,
     FILMSTUDIO_OT_create_shot,
     FILMSTUDIO_OT_set_mode,
+    FILMSTUDIO_OT_inspect_contract,
+    FILMSTUDIO_OT_execute_contract,
 )
 
 
