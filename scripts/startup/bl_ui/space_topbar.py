@@ -27,6 +27,26 @@ class TOPBAR_HT_upper_bar(Header):
 
         window = context.window
         screen = context.screen
+        film_state = getattr(window.scene, "film_studio", None)
+
+        if film_state is not None and not film_state.expert_mode:
+            layout.menu("TOPBAR_MT_blender", text="Film Studio Engine F0")
+            layout.separator(type='LINE')
+            layout.label(text=f"Project {film_state.project.identifier}", icon='FILE_FOLDER')
+            layout.label(text=f"Scene {film_state.story_scene.identifier}", icon='SCENE_DATA')
+            layout.label(text=f"Character {film_state.character.identifier}", icon='OUTLINER_OB_ARMATURE')
+            shot = film_state.shots[film_state.active_shot_index] if (
+                0 <= film_state.active_shot_index < len(film_state.shots)
+            ) else None
+            layout.label(text=f"Shot {shot.identifier if shot else '—'}", icon='CAMERA_DATA')
+            layout.operator(
+                "film_studio.create_shot",
+                text="Select Shot" if shot else "Create Shot",
+                icon='RESTRICT_SELECT_OFF' if shot else 'ADD',
+            )
+            mode = layout.operator("film_studio.set_mode", text="Expert Mode", icon='WORKSPACE')
+            mode.mode = 'EXPERT'
+            return
 
         TOPBAR_MT_editor_menus.draw_collapsible(context, layout)
 
@@ -36,6 +56,11 @@ class TOPBAR_HT_upper_bar(Header):
             layout.template_ID_tabs(window, "workspace", new="workspace.add", menu="TOPBAR_MT_workspace_menu")
         else:
             layout.operator("screen.back_to_previous", icon='SCREEN_BACK', text="Back to Previous")
+
+        if film_state is not None:
+            layout.separator(type='LINE')
+            mode = layout.operator("film_studio.set_mode", text="Film Mode", icon='HOME')
+            mode.mode = 'FILM'
 
     def draw_right(self, context):
         layout = self.layout

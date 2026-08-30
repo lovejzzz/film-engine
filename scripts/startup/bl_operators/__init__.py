@@ -21,6 +21,7 @@ _modules = [
     "constraint",
     "copy_global_transform",
     "file",
+    "film_studio_workspace",
     "geometry_nodes",
     "grease_pencil",
     "image",
@@ -63,6 +64,7 @@ def register():
     from . import (
         bone_selection_sets,
         copy_global_transform,
+        film_studio_workspace,
     )
 
     for mod in _modules_loaded:
@@ -71,6 +73,7 @@ def register():
 
     bone_selection_sets.register()
     copy_global_transform.register()
+    film_studio_workspace.register()
 
 
 def unregister():
@@ -78,8 +81,10 @@ def unregister():
     from . import (
         bone_selection_sets,
         copy_global_transform,
+        film_studio_workspace,
     )
 
+    film_studio_workspace.unregister()
     bone_selection_sets.unregister()
     copy_global_transform.unregister()
 
