@@ -81,6 +81,10 @@ class FilmStudioWorkspaceState(PropertyGroup):
     render_preview_status: StringProperty(name="Preview Status", default="NOT_INSPECTED")
     render_final_status: StringProperty(name="Final Status", default="NOT_INSPECTED")
     render_last_receipt_hash: StringProperty(name="Last Receipt Hash")
+    render_resume_status: StringProperty(name="Resume Status", default="NOT_INSPECTED")
+    render_next_stage: StringProperty(name="Next Stage", default="UNKNOWN")
+    render_completed_stages: StringProperty(name="Completed Stages", default="NONE")
+    render_last_decision_hash: StringProperty(name="Last Decision Hash")
     render_inspection_token: StringProperty(name="Render Inspection Token", options={'HIDDEN'})
 
 
@@ -238,6 +242,10 @@ class FILMSTUDIO_OT_inspect_render_job(Operator):
         state.render_preview_status = "NOT_INSPECTED"
         state.render_final_status = "NOT_INSPECTED"
         state.render_last_receipt_hash = ""
+        state.render_resume_status = "NOT_INSPECTED"
+        state.render_next_stage = "UNKNOWN"
+        state.render_completed_stages = "NONE"
+        state.render_last_decision_hash = ""
         try:
             result = film_studio_render.inspect_job(
                 bpy.path.abspath(state.render_repository_root),
@@ -249,6 +257,7 @@ class FILMSTUDIO_OT_inspect_render_job(Operator):
             state.render_job_id = ""
             state.render_approval_id = ""
             state.render_manifest_hash = ""
+            state.render_resume_status = f"REJECTED: {error.reason}"
             self.report({'ERROR'}, f"{error.reason}: {error}")
             return {'CANCELLED'}
         state.render_status = result["status"]
@@ -259,7 +268,61 @@ class FILMSTUDIO_OT_inspect_render_job(Operator):
         state.render_final_status = result["finalStatus"]
         state.render_last_receipt_hash = result["lastReceiptHash"]
         state.render_inspection_token = result["inspectionToken"]
+        if result["restartable"]:
+            try:
+                resume = film_studio_render.plan_resume(
+                    bpy.path.abspath(state.render_repository_root),
+                    state.render_manifest_uri,
+                    bpy.path.abspath(state.render_evidence_root),
+                )
+            except film_studio_render.RenderContractError as error:
+                state.render_resume_status = f"REJECTED: {error.reason}"
+                self.report({'ERROR'}, f"{error.reason}: {error}")
+                return {'CANCELLED'}
+            state.render_resume_status = resume["status"]
+            state.render_next_stage = resume["nextStage"]
+            state.render_completed_stages = ", ".join(resume["completedStages"]) or "NONE"
+        else:
+            state.render_resume_status = "NOT_AVAILABLE"
         self.report({'INFO'}, "Approved render job inspected; render calls: 0")
+        return {'FINISHED'}
+
+
+class FILMSTUDIO_OT_resume_render_job(Operator):
+    bl_idname = "film_studio.resume_render_job"
+    bl_label = "Resume Next Approved Stage"
+    bl_description = "Verify immutable completed stages and execute only the first unfinished approved render stage"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        state = getattr(context.scene, "film_studio", None)
+        return bool(
+            state
+            and state.render_repository_root
+            and state.render_manifest_uri
+            and state.render_evidence_root
+            and not state.render_resume_status.startswith("REJECTED")
+        )
+
+    def execute(self, context):
+        state = context.scene.film_studio
+        try:
+            result = film_studio_render.execute_next_stage(
+                bpy.path.abspath(state.render_repository_root),
+                state.render_manifest_uri,
+                bpy.path.abspath(state.render_evidence_root),
+            )
+        except film_studio_render.RenderContractError as error:
+            state.render_resume_status = f"REJECTED: {error.reason}"
+            state.render_next_stage = "BLOCKED"
+            self.report({'ERROR'}, f"{error.reason}: {error}")
+            return {'CANCELLED'}
+        state.render_resume_status = result["status"]
+        state.render_next_stage = result["nextStage"]
+        state.render_completed_stages = ", ".join(result["completedStages"]) or "NONE"
+        state.render_last_decision_hash = result["decisionHash"]
+        self.report({'INFO'}, f"Executed {result['executedStage']}; next: {result['nextStage']}")
         return {'FINISHED'}
 
 
@@ -274,6 +337,7 @@ classes = (
     FILMSTUDIO_OT_inspect_contract,
     FILMSTUDIO_OT_execute_contract,
     FILMSTUDIO_OT_inspect_render_job,
+    FILMSTUDIO_OT_resume_render_job,
 )
 
 

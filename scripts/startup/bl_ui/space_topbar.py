@@ -167,8 +167,16 @@ class TOPBAR_PT_film_render_job(Panel):
             status.label(text=f"Manifest: {state.render_manifest_hash[:12]}")
             status.label(text=f"Preview: {state.render_preview_status}")
             status.label(text=f"Final: {state.render_final_status}")
+            status.label(text=f"Resume: {state.render_resume_status}")
+            status.label(text=f"Completed: {state.render_completed_stages}")
+            status.label(text=f"Next: {state.render_next_stage}")
             if state.render_last_receipt_hash:
                 status.label(text=f"Receipt: {state.render_last_receipt_hash[:12]}")
+            if state.render_last_decision_hash:
+                status.label(text=f"Decision: {state.render_last_decision_hash[:12]}")
+            resume = layout.row()
+            resume.enabled = state.render_resume_status in {"RESUME_READY", "COMPLETE"}
+            resume.operator("film_studio.resume_render_job", icon='PLAY')
             status.label(text="Preview / Final: approved profiles only", icon='LOCKED')
             status.label(text="Python / shell / network: NOT APPROVED", icon='LOCKED')
 

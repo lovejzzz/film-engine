@@ -11,14 +11,22 @@ import json
 import math
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import bpy
 
 
 SCHEMA_VERSION = "bfs.filmStudioRenderJob.v0.1"
+RESTART_SCHEMA_VERSION = "bfs.filmStudioRenderJob.v0.2"
 STAGE_RECEIPT_SCHEMA = "bfs.filmStudioRenderStageReceipt.v0.1"
 FAILURE_RECEIPT_SCHEMA = "bfs.filmStudioRenderFailureReceipt.v0.1"
+RESUME_DECISION_SCHEMA = "bfs.filmStudioResumeDecisionReceipt.v0.1"
+
+STAGE_ARTIFACT_BUDGETS = {
+    "PREVIEW": 16 * 1024 * 1024,
+    "FINAL": 64 * 1024 * 1024,
+}
 
 FROZEN_PROFILES = {
     "PREVIEW": {
@@ -120,10 +128,40 @@ def _manifest_path(repository_root, manifest_uri):
     return root, path
 
 
+def _utc_timestamp(value, reason):
+    require(isinstance(value, str) and value.endswith("Z"), reason, "UTC timestamp must end in Z")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise RenderContractError(reason, "UTC timestamp is invalid") from error
+    require(parsed.tzinfo is not None, reason, "UTC timestamp has no timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _validate_job_control(manifest, observed_at=None):
+    control = manifest.get("jobControl")
+    require(isinstance(control, dict), "JOB_CONTROL_MISSING", "Restart-safe job control is absent")
+    require(control.get("stageOrder") == ["PREVIEW", "FINAL"], "STAGE_ORDER_MISMATCH", "Immutable stage order differs")
+    require(control.get("completedStagesImmutable") is True, "RESUME_POLICY_MISMATCH", "Completed stages are not immutable")
+    require(control.get("completeResumeIsNoOp") is True, "RESUME_POLICY_MISMATCH", "Complete resume is not a no-op")
+    maximum_calls = control.get("maximumRenderCalls")
+    maximum_bytes = control.get("maximumArtifactBytes")
+    require(isinstance(maximum_calls, int) and not isinstance(maximum_calls, bool) and 0 <= maximum_calls <= 2, "RENDER_BUDGET_INVALID", "Render-call budget is invalid")
+    require(isinstance(maximum_bytes, int) and not isinstance(maximum_bytes, bool) and 0 <= maximum_bytes <= 80 * 1024 * 1024, "ARTIFACT_BUDGET_INVALID", "Artifact-byte budget is invalid")
+    not_before = _utc_timestamp(control.get("notBefore"), "VALIDITY_WINDOW_INVALID")
+    valid_until = _utc_timestamp(control.get("validUntil"), "VALIDITY_WINDOW_INVALID")
+    require(not_before < valid_until, "VALIDITY_WINDOW_INVALID", "Job validity window is empty")
+    now = observed_at or datetime.now(timezone.utc)
+    require(now >= not_before, "JOB_NOT_YET_VALID", "Render job is not yet valid")
+    require(now <= valid_until, "JOB_EXPIRED", "Render job authorization expired")
+    return control
+
+
 def inspect_job(repository_root, manifest_uri, evidence_root, source_blend=None):
     root, manifest_path = _manifest_path(repository_root, manifest_uri)
     manifest = read_json(manifest_path, "MANIFEST_INVALID")
-    require(manifest.get("schemaVersion") == SCHEMA_VERSION, "SCHEMA_MISMATCH", "Render job schema differs")
+    schema_version = manifest.get("schemaVersion")
+    require(schema_version in {SCHEMA_VERSION, RESTART_SCHEMA_VERSION}, "SCHEMA_MISMATCH", "Render job schema differs")
     require(manifest.get("status") == "APPROVED", "JOB_NOT_APPROVED", "Render job is not approved")
     require(valid_self_hash(manifest, "manifestHash"), "MANIFEST_HASH_INVALID", "Render manifest self hash differs")
     authority = manifest.get("authority", {})
@@ -135,6 +173,8 @@ def inspect_job(repository_root, manifest_uri, evidence_root, source_blend=None)
         "outputScope": "AUTHORIZED_EVIDENCE_ROOT_ONLY",
     }, "AUTHORITY_MISMATCH", "Render authority differs")
     require(manifest.get("profiles") == FROZEN_PROFILES, "PROFILE_MISMATCH", "Frozen render profiles differ")
+    if schema_version == RESTART_SCHEMA_VERSION:
+        _validate_job_control(manifest)
 
     evidence = Path(evidence_root).resolve(strict=True)
     require(str(evidence) == manifest.get("authorizedEvidenceRoot"), "EVIDENCE_ROOT_MISMATCH", "Evidence root differs")
@@ -154,8 +194,9 @@ def inspect_job(repository_root, manifest_uri, evidence_root, source_blend=None)
         "approvedStages": authority["approvedStages"],
     }
     preview_receipt_path = evidence / "preview" / "receipt.json"
+    final_receipt_path = evidence / "final" / "receipt.json"
     if preview_receipt_path.exists():
-        preview_receipt = _verify_preview_receipt(evidence, manifest)
+        preview_receipt = _verify_stage_receipt(evidence, manifest, "PREVIEW")
         preview_status = "PASS"
         final_status = "READY"
         last_receipt_hash = preview_receipt["receiptHash"]
@@ -163,6 +204,11 @@ def inspect_job(repository_root, manifest_uri, evidence_root, source_blend=None)
         preview_status = "READY"
         final_status = "BLOCKED: PREVIEW_REQUIRED"
         last_receipt_hash = ""
+    if final_receipt_path.exists():
+        require(preview_receipt_path.exists(), "FINAL_RECEIPT_INVALID", "Final receipt exists without Preview")
+        final_receipt = _verify_stage_receipt(evidence, manifest, "FINAL")
+        final_status = "PASS"
+        last_receipt_hash = final_receipt["receiptHash"]
     return {
         "status": "APPROVED_READY",
         "jobId": manifest["jobId"],
@@ -172,21 +218,167 @@ def inspect_job(repository_root, manifest_uri, evidence_root, source_blend=None)
         "previewStatus": preview_status,
         "finalStatus": final_status,
         "lastReceiptHash": last_receipt_hash,
+        "restartable": schema_version == RESTART_SCHEMA_VERSION,
         "inspectionToken": sha256_bytes(canonical(token_body)),
         "manifest": manifest,
         "manifestPath": str(manifest_path.relative_to(root)),
     }
 
 
-def _verify_preview_receipt(evidence, manifest):
-    receipt_path = evidence / "preview" / "receipt.json"
-    receipt = read_json(receipt_path, "PREVIEW_RECEIPT_MISSING")
-    require(valid_self_hash(receipt, "receiptHash"), "PREVIEW_RECEIPT_INVALID", "Preview receipt self hash differs")
-    require(receipt.get("schemaVersion") == STAGE_RECEIPT_SCHEMA, "PREVIEW_RECEIPT_INVALID", "Preview receipt schema differs")
-    require(receipt.get("jobId") == manifest["jobId"] and receipt.get("stage") == "PREVIEW" and receipt.get("status") == "PASS", "PREVIEW_RECEIPT_INVALID", "Preview receipt identity differs")
-    output = evidence / receipt.get("output", {}).get("uri", "")
-    require(output.is_file() and sha256_file(output) == receipt["output"].get("sha256"), "PREVIEW_ARTIFACT_INVALID", "Preview artifact binding differs")
+def _verify_stage_receipt(evidence, manifest, stage):
+    reason = f"{stage}_RECEIPT_INVALID"
+    receipt_path = evidence / stage.lower() / "receipt.json"
+    receipt = read_json(receipt_path, f"{stage}_RECEIPT_MISSING")
+    require(valid_self_hash(receipt, "receiptHash"), reason, f"{stage.title()} receipt self hash differs")
+    require(receipt.get("schemaVersion") == STAGE_RECEIPT_SCHEMA, reason, f"{stage.title()} receipt schema differs")
+    require(receipt.get("jobId") == manifest["jobId"] and receipt.get("approvalId") == manifest["approvalId"] and receipt.get("manifestHash") == manifest["manifestHash"], reason, f"{stage.title()} receipt job identity differs")
+    require(receipt.get("stage") == stage and receipt.get("status") == "PASS", reason, f"{stage.title()} receipt stage differs")
+    require(receipt.get("profile") == FROZEN_PROFILES[stage], reason, f"{stage.title()} receipt profile differs")
+    require(receipt.get("process", {}).get("renderCalls") == 1, reason, f"{stage.title()} render count differs")
+    output_record = receipt.get("output", {})
+    require(output_record.get("uri") == FROZEN_PROFILES[stage]["output"], reason, f"{stage.title()} output URI differs")
+    output = resolved_inside(evidence, output_record["uri"], f"{stage}_ARTIFACT_INVALID")
+    require(output.is_file() and not output.is_symlink(), f"{stage}_ARTIFACT_INVALID", f"{stage.title()} artifact is absent")
+    require(output.stat().st_size == output_record.get("bytes") and sha256_file(output) == output_record.get("sha256"), f"{stage}_ARTIFACT_INVALID", f"{stage.title()} artifact binding differs")
     return receipt
+
+
+def _verify_preview_receipt(evidence, manifest):
+    return _verify_stage_receipt(evidence, manifest, "PREVIEW")
+
+
+def plan_resume(repository_root, manifest_uri, evidence_root):
+    inspected = inspect_job(repository_root, manifest_uri, evidence_root)
+    require(inspected["restartable"], "JOB_NOT_RESTARTABLE", "Render job has no restart-safe contract")
+    manifest = inspected["manifest"]
+    control = _validate_job_control(manifest)
+    evidence = Path(evidence_root).resolve(strict=True)
+    completed = []
+    receipts = []
+    for stage in control["stageOrder"]:
+        receipt_path = evidence / stage.lower() / "receipt.json"
+        if not receipt_path.exists():
+            break
+        if stage == "FINAL":
+            require(completed == ["PREVIEW"], "FINAL_RECEIPT_INVALID", "Final cannot precede Preview")
+        receipt = _verify_stage_receipt(evidence, manifest, stage)
+        completed.append(stage)
+        receipts.append(receipt)
+    require(not (evidence / "final" / "receipt.json").exists() or completed == ["PREVIEW", "FINAL"], "FINAL_RECEIPT_INVALID", "Final stage chain differs")
+    spent_calls = sum(receipt["process"]["renderCalls"] for receipt in receipts)
+    spent_bytes = sum(receipt["output"]["bytes"] for receipt in receipts)
+    require(spent_calls <= control["maximumRenderCalls"], "RENDER_BUDGET_EXCEEDED", "Completed stages exceed render-call budget")
+    require(spent_bytes <= control["maximumArtifactBytes"], "ARTIFACT_BUDGET_EXCEEDED", "Completed artifacts exceed byte budget")
+    next_stage = control["stageOrder"][len(completed)] if len(completed) < len(control["stageOrder"]) else "COMPLETE"
+    if next_stage != "COMPLETE":
+        require(spent_calls + 1 <= control["maximumRenderCalls"], "RENDER_BUDGET_EXHAUSTED", "No render-call budget remains")
+        require(spent_bytes + STAGE_ARTIFACT_BUDGETS[next_stage] <= control["maximumArtifactBytes"], "ARTIFACT_BUDGET_EXHAUSTED", "No artifact-byte budget remains")
+    token_body = {
+        "manifestHash": manifest["manifestHash"],
+        "completedStages": completed,
+        "completedReceiptHashes": [receipt["receiptHash"] for receipt in receipts],
+        "nextStage": next_stage,
+        "spentRenderCalls": spent_calls,
+        "spentArtifactBytes": spent_bytes,
+    }
+    return {
+        "status": "COMPLETE" if next_stage == "COMPLETE" else "RESUME_READY",
+        "jobId": manifest["jobId"],
+        "manifestHash": manifest["manifestHash"],
+        "completedStages": completed,
+        "completedReceiptHashes": token_body["completedReceiptHashes"],
+        "nextStage": next_stage,
+        "spentRenderCalls": spent_calls,
+        "spentArtifactBytes": spent_bytes,
+        "remainingRenderCalls": control["maximumRenderCalls"] - spent_calls,
+        "remainingArtifactBytes": control["maximumArtifactBytes"] - spent_bytes,
+        "resumeToken": sha256_bytes(canonical(token_body)),
+        "manifest": manifest,
+    }
+
+
+def _apply_resume_state(plan, decision_hash=""):
+    state = getattr(bpy.context.scene, "film_studio", None)
+    if state is None:
+        return
+    state.render_resume_status = plan["status"]
+    state.render_next_stage = plan["nextStage"]
+    state.render_completed_stages = ", ".join(plan["completedStages"]) or "NONE"
+    state.render_last_decision_hash = decision_hash
+
+
+def _write_resume_decision(evidence, plan_before, plan_after, executed_stage, stage_receipt):
+    sequence = len(plan_before["completedStages"]) + 1
+    label = executed_stage.lower() if executed_stage != "COMPLETE" else "complete"
+    body = {
+        "schemaVersion": RESUME_DECISION_SCHEMA,
+        "status": "PASS",
+        "jobId": plan_before["jobId"],
+        "manifestHash": plan_before["manifestHash"],
+        "sequence": sequence,
+        "completedStagesBefore": plan_before["completedStages"],
+        "immutableSkippedStages": plan_before["completedStages"],
+        "executedStage": executed_stage,
+        "completedStagesAfter": plan_after["completedStages"],
+        "nextStageAfter": plan_after["nextStage"],
+        "renderCallsThisDecision": 0 if executed_stage == "COMPLETE" else 1,
+        "stageReceiptHash": stage_receipt.get("receiptHash") if stage_receipt else None,
+        "resumeTokenBefore": plan_before["resumeToken"],
+        "resumeTokenAfter": plan_after["resumeToken"],
+        "process": {"pid": os.getpid(), "mouseInteractions": 0, "networkCalls": 0},
+    }
+    return exclusive_receipt(
+        evidence / "job-control" / f"{sequence:02d}-{label}.json",
+        body,
+        "decisionHash",
+    )
+
+
+def execute_next_stage(repository_root, manifest_uri, evidence_root):
+    evidence = Path(evidence_root).resolve(strict=True)
+    plan_before = plan_resume(repository_root, manifest_uri, evidence)
+    executed_stage = plan_before["nextStage"]
+    if executed_stage == "COMPLETE":
+        stage_receipt = None
+        plan_after = plan_before
+    else:
+        stage_receipt = execute_stage(repository_root, manifest_uri, evidence, executed_stage)
+        plan_after = plan_resume(repository_root, manifest_uri, evidence)
+    decision = _write_resume_decision(evidence, plan_before, plan_after, executed_stage, stage_receipt)
+    _apply_resume_state(plan_after, decision["decisionHash"])
+    return {
+        "status": plan_after["status"],
+        "executedStage": executed_stage,
+        "nextStage": plan_after["nextStage"],
+        "completedStages": plan_after["completedStages"],
+        "renderCalls": 0 if executed_stage == "COMPLETE" else 1,
+        "stageReceiptHash": stage_receipt.get("receiptHash") if stage_receipt else None,
+        "decisionHash": decision["decisionHash"],
+    }
+
+
+def plan_resume_with_failure_receipt(repository_root, manifest_uri, evidence_root, failure_name):
+    evidence = Path(evidence_root).resolve(strict=True)
+    source = Path(bpy.data.filepath).resolve(strict=True)
+    source_before = sha256_file(source)
+    before_entries = sorted(path.relative_to(evidence).as_posix() for path in evidence.rglob("*") if path.is_file())
+    try:
+        return plan_resume(repository_root, manifest_uri, evidence)
+    except RenderContractError as error:
+        body = {
+            "schemaVersion": FAILURE_RECEIPT_SCHEMA,
+            "status": "REJECTED",
+            "reason": error.reason,
+            "message": str(error),
+            "stage": "RESUME",
+            "manifestUri": manifest_uri,
+            "process": {"pid": os.getpid(), "renderCalls": 0, "mouseInteractions": 0, "networkCalls": 0},
+            "source": {"sha256BeforeAndAfter": source_before, "unchanged": sha256_file(source) == source_before},
+            "preexistingEvidenceFiles": before_entries,
+            "newRenderArtifactsWritten": 0,
+        }
+        exclusive_receipt(evidence / "failures" / f"{failure_name}.json", body, "failureHash")
+        raise
 
 
 def _configure_scene(stage, output):
