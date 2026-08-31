@@ -46,6 +46,7 @@ class TOPBAR_HT_upper_bar(Header):
             )
             layout.popover(panel="TOPBAR_PT_film_contract", text="Contract", icon='FILE_TICK')
             layout.popover(panel="TOPBAR_PT_film_render_job", text="Render", icon='RENDER_ANIMATION')
+            layout.popover(panel="TOPBAR_PT_film_vertical_slice", text="Slice", icon='SEQUENCE')
             mode = layout.operator("film_studio.set_mode", text="Expert Mode", icon='WORKSPACE')
             mode.mode = 'EXPERT'
             return
@@ -178,6 +179,37 @@ class TOPBAR_PT_film_render_job(Panel):
             resume.enabled = state.render_resume_status in {"RESUME_READY", "COMPLETE"}
             resume.operator("film_studio.resume_render_job", icon='PLAY')
             status.label(text="Preview / Final: approved profiles only", icon='LOCKED')
+            status.label(text="Python / shell / network: NOT APPROVED", icon='LOCKED')
+
+
+class TOPBAR_PT_film_vertical_slice(Panel):
+    bl_idname = "TOPBAR_PT_film_vertical_slice"
+    bl_label = "B62 Three-Shot Vertical Slice"
+    bl_space_type = 'TOPBAR'
+    bl_region_type = 'HEADER'
+    bl_ui_units_x = 30
+
+    def draw(self, context):
+        layout = self.layout
+        state = context.scene.film_studio
+        layout.prop(state, "slice_repository_root")
+        layout.prop(state, "slice_manifest_uri")
+        layout.prop(state, "slice_evidence_root")
+        layout.operator("film_studio.inspect_vertical_slice", icon='VIEWZOOM')
+        status = layout.box()
+        status.label(text=f"Status: {state.slice_status}")
+        if state.slice_id:
+            status.label(text=f"Slice: {state.slice_id}")
+            status.label(text=f"Shared: {state.slice_shared_identity[:12]}")
+            status.label(text=f"Shot: {state.slice_current_shot}")
+            status.label(text=f"Frames: {state.slice_completed_frames}/288")
+            status.label(text=state.slice_historical_boundary, icon='LOCKED')
+            status.label(text="Human review: PENDING UNTIL PB.7", icon='TIME')
+            build = layout.row()
+            build.enabled = state.slice_status == "APPROVED_READY" and bool(state.slice_inspection_token)
+            build.operator("film_studio.build_vertical_slice_review", icon='RENDER_ANIMATION')
+            if state.slice_last_receipt_hash:
+                status.label(text=f"Receipt: {state.slice_last_receipt_hash[:12]}")
             status.label(text="Python / shell / network: NOT APPROVED", icon='LOCKED')
 
 
@@ -984,6 +1016,7 @@ classes = (
     TOPBAR_PT_tool_settings_extra,
     TOPBAR_PT_film_contract,
     TOPBAR_PT_film_render_job,
+    TOPBAR_PT_film_vertical_slice,
     TOPBAR_PT_gpencil_primitive,
     TOPBAR_PT_name,
     TOPBAR_PT_name_marker,

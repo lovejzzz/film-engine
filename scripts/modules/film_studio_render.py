@@ -22,6 +22,9 @@ RESTART_SCHEMA_VERSION = "bfs.filmStudioRenderJob.v0.2"
 STAGE_RECEIPT_SCHEMA = "bfs.filmStudioRenderStageReceipt.v0.1"
 FAILURE_RECEIPT_SCHEMA = "bfs.filmStudioRenderFailureReceipt.v0.1"
 RESUME_DECISION_SCHEMA = "bfs.filmStudioResumeDecisionReceipt.v0.1"
+SLICE_SCHEMA_VERSION = "bfs.filmStudioVerticalSlice.v0.1"
+SLICE_SHOT_RECEIPT_SCHEMA = "bfs.filmStudioVerticalSliceShotReceipt.v0.1"
+SLICE_RECEIPT_SCHEMA = "bfs.filmStudioVerticalSliceReceipt.v0.1"
 
 STAGE_ARTIFACT_BUDGETS = {
     "PREVIEW": 16 * 1024 * 1024,
@@ -56,6 +59,40 @@ FROZEN_PROFILES = {
         "requiredPasses": ["Combined", "Depth", "Normal"],
         "output": "final/final.exr",
     },
+}
+
+SLICE_PROFILE = {
+    "engine": "BLENDER_EEVEE",
+    "resolution": [640, 360, 100],
+    "samples": 16,
+    "frames": [1, 288],
+    "format": "PNG",
+    "colorMode": "RGBA",
+    "colorDepth": "8",
+    "fps": 24,
+    "reviewVideo": "review/B62-PB6-THREE-SHOT.mp4",
+    "humanReviewStatus": "PENDING_UNTIL_PB7",
+}
+
+SLICE_SHOTS = [
+    {"id": "WIDE", "name": "WIDE_APPROACH", "framesInclusive": [1, 96], "marker": "SHOT_WIDE_APPROACH", "camera": "CAM_WIDE_APPROACH"},
+    {"id": "MEDIUM", "name": "MEDIUM_CONTACT", "framesInclusive": [97, 192], "marker": "SHOT_MEDIUM_CONTACT", "camera": "CAM_MEDIUM_CONTACT"},
+    {"id": "CLOSE", "name": "CLOSE_REFLECTION", "framesInclusive": [193, 288], "marker": "SHOT_CLOSE_REFLECTION", "camera": "CAM_CLOSE_MOTION_TERMINAL"},
+]
+
+SLICE_ASSET_IDENTITIES = {
+    "CHAR_B62_GUARDIAN": "d03a680766dbd454d2913ae74d66f3cdd2a6fd93fb423de2601049dcb3eba416",
+    "PROP_B62_CONSOLE_CORE": "31a11b94cbcf0fafb61d301e9ff3dd5ad97d6b7a2424d4cc21c3403921a07b7e",
+    "SET_B62_OBSERVATORY": "758f53592659e76f020feabeb1a5694d36e68000e0ce9c5bb0011aa6d93c3ba1",
+}
+
+SLICE_HISTORICAL_BOUNDARY = {
+    "verdict": "B62_CLOSE_CAMERA_CORRECTION_FAILS_FROZEN_HOLDOUT",
+    "frame": 288,
+    "metric": "clampedUnionAreaFraction",
+    "observed": 0.93378717684983,
+    "maximum": 0.9,
+    "mustRemainRejected": True,
 }
 
 
@@ -489,6 +526,182 @@ def execute_stage_with_failure_receipt(repository_root, manifest_uri, evidence_r
             "manifestUri": manifest_uri,
             "process": {"pid": os.getpid(), "renderCalls": 0, "mouseInteractions": 0, "networkCalls": 0},
             "source": {"sha256BeforeAndAfter": source_before, "unchanged": sha256_file(source) == source_before},
+        }
+        exclusive_receipt(evidence / "failures" / f"{failure_name}.json", body, "failureHash")
+        raise
+
+
+def _slice_manifest(repository_root, manifest_uri, evidence_root, source_blend=None):
+    root, manifest_path = _manifest_path(repository_root, manifest_uri)
+    manifest = read_json(manifest_path, "MANIFEST_INVALID")
+    require(manifest.get("schemaVersion") == SLICE_SCHEMA_VERSION, "SCHEMA_MISMATCH", "Vertical-slice schema differs")
+    require(manifest.get("status") == "APPROVED", "JOB_NOT_APPROVED", "Vertical slice is not approved")
+    require(valid_self_hash(manifest, "manifestHash"), "MANIFEST_HASH_INVALID", "Vertical-slice manifest self hash differs")
+    require(manifest.get("authority") == {
+        "approvedOperation": "BUILD_B62_REVIEW_ANIMATIC",
+        "modelMayGeneratePython": False,
+        "networkAllowed": False,
+        "sourceBlendMayBeSaved": False,
+        "outputScope": "AUTHORIZED_EVIDENCE_ROOT_ONLY",
+    }, "AUTHORITY_MISMATCH", "Vertical-slice authority differs")
+    require(manifest.get("shots") == SLICE_SHOTS, "SHOT_ROSTER_INVALID", "Frozen three-shot roster differs")
+    require(manifest.get("reviewProfile") == SLICE_PROFILE, "PROFILE_MISMATCH", "Frozen review profile differs")
+    shared = manifest.get("sharedNonCameraIdentity", {})
+    require(shared.get("assetIdentityHashes") == SLICE_ASSET_IDENTITIES, "SHARED_IDENTITY_MISMATCH", "Shared asset identity differs")
+    require(shared.get("stateHash") == "bb9e0d1c29ddd871f04e082cfca13c28c1d0a5b885eb04a38899aa6c84564d8d", "SHARED_IDENTITY_MISMATCH", "Shared state identity differs")
+    historical_boundary = manifest.get("historicalFrame288Boundary")
+    require(isinstance(historical_boundary, dict), "HISTORICAL_BOUNDARY_MISSING", "Frozen frame-288 rejection is absent")
+    require(historical_boundary.get("maximum") == 0.9, "HUMAN_BOUNDARY_MUTATED", "Frame-288 maximum was relaxed")
+    require(historical_boundary == SLICE_HISTORICAL_BOUNDARY, "HISTORICAL_BOUNDARY_MISSING", "Frozen frame-288 rejection differs")
+
+    evidence = Path(evidence_root).resolve(strict=True)
+    require(str(evidence) == manifest.get("authorizedEvidenceRoot"), "EVIDENCE_ROOT_MISMATCH", "Evidence root differs")
+    source = Path(source_blend or bpy.data.filepath).resolve(strict=True)
+    source_record = manifest.get("source", {})
+    require(str(source) == source_record.get("absolutePath"), "SOURCE_PATH_MISMATCH", "B62 source path differs")
+    require(sha256_file(source) == source_record.get("sha256"), "SOURCE_HASH_MISMATCH", "B62 source hash differs")
+    require(source_record.get("sha256") == "0acd4d135c9bac9a7928a9a38da1a0e2f4838fd052a87a9663cef83cb2c373dc", "SOURCE_HASH_MISMATCH", "B62 source is not the admitted terminal scene")
+
+    inherited = manifest.get("inheritedEvidence", [])
+    require(len(inherited) == 4, "INHERITED_EVIDENCE_MISMATCH", "Inherited evidence roster differs")
+    for record in inherited:
+        inherited_path = resolved_inside(root, record.get("uri"), "INHERITED_EVIDENCE_MISMATCH")
+        require(inherited_path.is_file() and sha256_file(inherited_path) == record.get("sha256"), "INHERITED_EVIDENCE_MISMATCH", "Inherited evidence bytes differ")
+        inherited_value = read_json(inherited_path, "INHERITED_EVIDENCE_MISMATCH")
+        require(inherited_value.get(record.get("hashField")) == record.get("selfHash"), "INHERITED_EVIDENCE_MISMATCH", "Inherited evidence self hash differs")
+
+    scene = bpy.context.scene
+    for shot in SLICE_SHOTS:
+        camera = bpy.data.objects.get(shot["camera"])
+        marker = scene.timeline_markers.get(shot["marker"])
+        require(camera is not None and camera.type == 'CAMERA', "SHOT_ROSTER_INVALID", f"Missing camera {shot['camera']}")
+        require(marker is not None and marker.frame == shot["framesInclusive"][0] and marker.camera == camera, "SHOT_ROSTER_INVALID", f"Marker route differs for {shot['id']}")
+    for collection_name in SLICE_ASSET_IDENTITIES:
+        require(bpy.data.collections.get(collection_name) is not None, "SHARED_IDENTITY_MISMATCH", f"Missing shared collection {collection_name}")
+    return root, manifest_path, manifest, evidence, source
+
+
+def inspect_vertical_slice(repository_root, manifest_uri, evidence_root, source_blend=None):
+    root, manifest_path, manifest, _evidence, source = _slice_manifest(repository_root, manifest_uri, evidence_root, source_blend)
+    token_body = {
+        "manifestHash": manifest["manifestHash"],
+        "sourceSha256": sha256_file(source),
+        "stateHash": manifest["sharedNonCameraIdentity"]["stateHash"],
+        "shots": SLICE_SHOTS,
+        "historicalFrame288Boundary": SLICE_HISTORICAL_BOUNDARY,
+    }
+    return {
+        "status": "APPROVED_READY",
+        "sliceId": manifest["sliceId"],
+        "manifestHash": manifest["manifestHash"],
+        "sharedStateHash": manifest["sharedNonCameraIdentity"]["stateHash"],
+        "historicalBoundary": "RETAINED_REJECT: 0.93378717684983 > 0.90",
+        "completedFrames": 0,
+        "currentShot": "WIDE",
+        "inspectionToken": sha256_bytes(canonical(token_body)),
+        "manifestPath": str(manifest_path.relative_to(root)),
+    }
+
+
+def _slice_shot_for_frame(frame):
+    return next(shot for shot in SLICE_SHOTS if shot["framesInclusive"][0] <= frame <= shot["framesInclusive"][1])
+
+
+def _configure_slice_scene():
+    scene = bpy.context.scene
+    scene.render.engine = "BLENDER_EEVEE"
+    scene.render.resolution_x, scene.render.resolution_y, scene.render.resolution_percentage = SLICE_PROFILE["resolution"]
+    scene.render.image_settings.media_type = "IMAGE"
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.image_settings.color_mode = "RGBA"
+    scene.render.image_settings.color_depth = "8"
+    scene.render.use_file_extension = True
+    scene.render.film_transparent = False
+    scene.render.fps = SLICE_PROFILE["fps"]
+    scene.eevee.taa_render_samples = SLICE_PROFILE["samples"]
+
+
+def execute_vertical_slice(repository_root, manifest_uri, evidence_root, inspection_token):
+    inspected = inspect_vertical_slice(repository_root, manifest_uri, evidence_root)
+    require(inspection_token == inspected["inspectionToken"], "INSPECTION_TOKEN_MISMATCH", "Vertical slice was not executed from the exact inspection")
+    _root, _manifest_path_value, manifest, evidence, source = _slice_manifest(repository_root, manifest_uri, evidence_root)
+    frames_root = evidence / "frames"
+    require(not frames_root.exists() and not (evidence / "slice" / "receipt.json").exists(), "OUTPUT_PATH_EXISTS", "Vertical-slice output is not fresh")
+    frames_root.mkdir(parents=True)
+    source_before = sha256_file(source)
+    _configure_slice_scene()
+    scene = bpy.context.scene
+    frame_records = []
+    shot_records = []
+    started = time.perf_counter()
+    for frame in range(1, 289):
+        shot = _slice_shot_for_frame(frame)
+        scene.frame_set(frame)
+        scene.camera = bpy.data.objects[shot["camera"]]
+        output = frames_root / f"frame-{frame:04d}.png"
+        scene.render.filepath = str(output)
+        result = bpy.ops.render.render(write_still=True)
+        require("FINISHED" in result and output.is_file() and output.stat().st_size > 0, "RENDER_FAILED", f"Frame {frame} failed")
+        frame_records.append({"frame": frame, "shot": shot["id"], "camera": scene.camera.name, "uri": output.relative_to(evidence).as_posix(), "bytes": output.stat().st_size, "sha256": sha256_file(output)})
+        if frame in {96, 192, 288}:
+            shot_frames = frame_records[-96:]
+            shot_body = {
+                "schemaVersion": SLICE_SHOT_RECEIPT_SCHEMA,
+                "status": "PASS",
+                "sliceId": manifest["sliceId"],
+                "manifestHash": manifest["manifestHash"],
+                "shot": shot,
+                "sharedStateHash": manifest["sharedNonCameraIdentity"]["stateHash"],
+                "assetIdentityHashes": SLICE_ASSET_IDENTITIES,
+                "frames": shot_frames,
+                "process": {"pid": os.getpid(), "renderCalls": 96, "mouseInteractions": 0, "networkCalls": 0},
+            }
+            shot_records.append(exclusive_receipt(evidence / "shots" / shot["id"].lower() / "receipt.json", shot_body, "receiptHash"))
+        require(sum(row["bytes"] for row in frame_records) <= 512 * 1024 * 1024, "ARTIFACT_BUDGET_EXCEEDED", "Vertical-slice frames exceed evidence budget")
+    elapsed = time.perf_counter() - started
+    require(sha256_file(source) == source_before, "SOURCE_CHANGED", "B62 source changed during render")
+    body = {
+        "schemaVersion": SLICE_RECEIPT_SCHEMA,
+        "status": "PASS",
+        "sliceId": manifest["sliceId"],
+        "manifestHash": manifest["manifestHash"],
+        "inspectionToken": inspection_token,
+        "source": {"sha256BeforeAndAfter": source_before, "unchanged": True},
+        "sharedNonCameraIdentity": manifest["sharedNonCameraIdentity"],
+        "historicalFrame288Boundary": SLICE_HISTORICAL_BOUNDARY,
+        "shots": [{"id": row["shot"]["id"], "receiptHash": row["receiptHash"]} for row in shot_records],
+        "frames": {"count": 288, "bytes": sum(row["bytes"] for row in frame_records), "rosterHash": sha256_bytes(canonical(frame_records))},
+        "timing": {"renderSeconds": elapsed},
+        "process": {"pid": os.getpid(), "renderCalls": 288, "mouseInteractions": 0, "networkCalls": 0},
+        "humanReviewStatus": "PENDING_UNTIL_PB7",
+    }
+    receipt = exclusive_receipt(evidence / "slice" / "receipt.json", body, "receiptHash")
+    state = getattr(scene, "film_studio", None)
+    if state is not None:
+        state.slice_status = "PASS_REVIEW_READY"
+        state.slice_current_shot = "COMPLETE"
+        state.slice_completed_frames = 288
+        state.slice_last_receipt_hash = receipt["receiptHash"]
+    return receipt
+
+
+def inspect_vertical_slice_with_failure_receipt(repository_root, manifest_uri, evidence_root, failure_name):
+    evidence = Path(evidence_root).resolve(strict=True)
+    source = Path(bpy.data.filepath).resolve(strict=True)
+    source_before = sha256_file(source)
+    try:
+        return inspect_vertical_slice(repository_root, manifest_uri, evidence)
+    except RenderContractError as error:
+        body = {
+            "schemaVersion": FAILURE_RECEIPT_SCHEMA,
+            "status": "REJECTED",
+            "reason": error.reason,
+            "message": str(error),
+            "stage": "B62_SLICE_INSPECTION",
+            "manifestUri": manifest_uri,
+            "process": {"pid": os.getpid(), "renderCalls": 0, "mouseInteractions": 0, "networkCalls": 0},
+            "source": {"sha256BeforeAndAfter": source_before, "unchanged": sha256_file(source) == source_before},
+            "newRenderArtifactsWritten": 0,
         }
         exclusive_receipt(evidence / "failures" / f"{failure_name}.json", body, "failureHash")
         raise

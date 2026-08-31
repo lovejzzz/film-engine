@@ -86,6 +86,18 @@ class FilmStudioWorkspaceState(PropertyGroup):
     render_completed_stages: StringProperty(name="Completed Stages", default="NONE")
     render_last_decision_hash: StringProperty(name="Last Decision Hash")
     render_inspection_token: StringProperty(name="Render Inspection Token", options={'HIDDEN'})
+    slice_repository_root: StringProperty(name="Repository Root", subtype='DIR_PATH')
+    slice_manifest_uri: StringProperty(name="Vertical Slice Manifest URI")
+    slice_evidence_root: StringProperty(name="Evidence Root", subtype='DIR_PATH')
+    slice_status: StringProperty(name="Slice Status", default="NOT_INSPECTED")
+    slice_id: StringProperty(name="Slice ID")
+    slice_manifest_hash: StringProperty(name="Manifest Hash")
+    slice_shared_identity: StringProperty(name="Shared Identity")
+    slice_historical_boundary: StringProperty(name="Frame 288 Boundary")
+    slice_current_shot: StringProperty(name="Current Shot", default="UNKNOWN")
+    slice_completed_frames: IntProperty(name="Completed Frames", default=0, min=0, max=288)
+    slice_last_receipt_hash: StringProperty(name="Last Receipt Hash")
+    slice_inspection_token: StringProperty(name="Slice Inspection Token", options={'HIDDEN'})
 
 
 def active_shot(state):
@@ -326,6 +338,70 @@ class FILMSTUDIO_OT_resume_render_job(Operator):
         return {'FINISHED'}
 
 
+class FILMSTUDIO_OT_inspect_vertical_slice(Operator):
+    bl_idname = "film_studio.inspect_vertical_slice"
+    bl_label = "Inspect B62 Three-Shot Slice"
+    bl_description = "Validate the exact B62 scene, shared non-camera identity and retained frame-288 rejection without rendering"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        state = context.scene.film_studio
+        state.slice_inspection_token = ""
+        try:
+            result = film_studio_render.inspect_vertical_slice(
+                bpy.path.abspath(state.slice_repository_root),
+                state.slice_manifest_uri,
+                bpy.path.abspath(state.slice_evidence_root),
+            )
+        except film_studio_render.RenderContractError as error:
+            state.slice_status = f"REJECTED: {error.reason}"
+            self.report({'ERROR'}, f"{error.reason}: {error}")
+            return {'CANCELLED'}
+        state.slice_status = result["status"]
+        state.slice_id = result["sliceId"]
+        state.slice_manifest_hash = result["manifestHash"]
+        state.slice_shared_identity = result["sharedStateHash"]
+        state.slice_historical_boundary = result["historicalBoundary"]
+        state.slice_current_shot = result["currentShot"]
+        state.slice_completed_frames = result["completedFrames"]
+        state.slice_inspection_token = result["inspectionToken"]
+        self.report({'INFO'}, "B62 three-shot slice inspected; render calls: 0")
+        return {'FINISHED'}
+
+
+class FILMSTUDIO_OT_build_vertical_slice_review(Operator):
+    bl_idname = "film_studio.build_vertical_slice_review"
+    bl_label = "Build B62 Review Animatic"
+    bl_description = "Render the approved 96/96/96-frame B62 review slice while preserving the historical frame-288 rejection"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        state = getattr(context.scene, "film_studio", None)
+        return bool(state and state.slice_status == "APPROVED_READY" and state.slice_inspection_token)
+
+    def execute(self, context):
+        state = context.scene.film_studio
+        try:
+            receipt = film_studio_render.execute_vertical_slice(
+                bpy.path.abspath(state.slice_repository_root),
+                state.slice_manifest_uri,
+                bpy.path.abspath(state.slice_evidence_root),
+                state.slice_inspection_token,
+            )
+        except film_studio_render.RenderContractError as error:
+            state.slice_status = f"REJECTED: {error.reason}"
+            self.report({'ERROR'}, f"{error.reason}: {error}")
+            return {'CANCELLED'}
+        state.slice_status = "PASS_REVIEW_READY"
+        state.slice_current_shot = "COMPLETE"
+        state.slice_completed_frames = 288
+        state.slice_last_receipt_hash = receipt["receiptHash"]
+        state.slice_inspection_token = ""
+        self.report({'INFO'}, "B62 three-shot review frames complete; human review remains pending")
+        return {'FINISHED'}
+
+
 classes = (
     FilmStudioProjectState,
     FilmStudioSceneState,
@@ -338,6 +414,8 @@ classes = (
     FILMSTUDIO_OT_execute_contract,
     FILMSTUDIO_OT_inspect_render_job,
     FILMSTUDIO_OT_resume_render_job,
+    FILMSTUDIO_OT_inspect_vertical_slice,
+    FILMSTUDIO_OT_build_vertical_slice_review,
 )
 
 
