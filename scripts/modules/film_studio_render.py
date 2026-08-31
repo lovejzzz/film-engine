@@ -582,7 +582,7 @@ def _slice_manifest(repository_root, manifest_uri, evidence_root, source_blend=N
 
 
 def inspect_vertical_slice(repository_root, manifest_uri, evidence_root, source_blend=None):
-    root, manifest_path, manifest, _evidence, source = _slice_manifest(repository_root, manifest_uri, evidence_root, source_blend)
+    root, manifest_path, manifest, evidence, source = _slice_manifest(repository_root, manifest_uri, evidence_root, source_blend)
     token_body = {
         "manifestHash": manifest["manifestHash"],
         "sourceSha256": sha256_file(source),
@@ -590,14 +590,34 @@ def inspect_vertical_slice(repository_root, manifest_uri, evidence_root, source_
         "shots": SLICE_SHOTS,
         "historicalFrame288Boundary": SLICE_HISTORICAL_BOUNDARY,
     }
+    status = "APPROVED_READY"
+    completed_frames = 0
+    current_shot = "WIDE"
+    last_receipt_hash = ""
+    receipt_path = evidence / "slice" / "receipt.json"
+    if receipt_path.exists():
+        receipt = read_json(receipt_path, "SLICE_RECEIPT_INVALID")
+        require(valid_self_hash(receipt, "receiptHash"), "SLICE_RECEIPT_INVALID", "Vertical-slice receipt self hash differs")
+        require(receipt.get("schemaVersion") == SLICE_RECEIPT_SCHEMA and receipt.get("status") == "PASS", "SLICE_RECEIPT_INVALID", "Vertical-slice receipt schema/status differs")
+        require(receipt.get("sliceId") == manifest["sliceId"] and receipt.get("manifestHash") == manifest["manifestHash"], "SLICE_RECEIPT_INVALID", "Vertical-slice receipt identity differs")
+        require(receipt.get("frames", {}).get("count") == 288 and receipt.get("process", {}).get("renderCalls") == 288, "SLICE_RECEIPT_INVALID", "Vertical-slice completion differs")
+        require(receipt.get("historicalFrame288Boundary") == SLICE_HISTORICAL_BOUNDARY, "SLICE_RECEIPT_INVALID", "Vertical-slice historical boundary differs")
+        for shot in SLICE_SHOTS:
+            shot_receipt = read_json(evidence / "shots" / shot["id"].lower() / "receipt.json", "SLICE_RECEIPT_INVALID")
+            require(valid_self_hash(shot_receipt, "receiptHash") and shot_receipt.get("shot") == shot and len(shot_receipt.get("frames", [])) == 96, "SLICE_RECEIPT_INVALID", f"{shot['id']} receipt differs")
+        status = "PASS_REVIEW_READY"
+        completed_frames = 288
+        current_shot = "COMPLETE"
+        last_receipt_hash = receipt["receiptHash"]
     return {
-        "status": "APPROVED_READY",
+        "status": status,
         "sliceId": manifest["sliceId"],
         "manifestHash": manifest["manifestHash"],
         "sharedStateHash": manifest["sharedNonCameraIdentity"]["stateHash"],
         "historicalBoundary": "RETAINED_REJECT: 0.93378717684983 > 0.90",
-        "completedFrames": 0,
-        "currentShot": "WIDE",
+        "completedFrames": completed_frames,
+        "currentShot": current_shot,
+        "lastReceiptHash": last_receipt_hash,
         "inspectionToken": sha256_bytes(canonical(token_body)),
         "manifestPath": str(manifest_path.relative_to(root)),
     }

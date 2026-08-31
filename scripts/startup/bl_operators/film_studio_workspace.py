@@ -364,6 +364,7 @@ class FILMSTUDIO_OT_inspect_vertical_slice(Operator):
         state.slice_historical_boundary = result["historicalBoundary"]
         state.slice_current_shot = result["currentShot"]
         state.slice_completed_frames = result["completedFrames"]
+        state.slice_last_receipt_hash = result["lastReceiptHash"]
         state.slice_inspection_token = result["inspectionToken"]
         self.report({'INFO'}, "B62 three-shot slice inspected; render calls: 0")
         return {'FINISHED'}
