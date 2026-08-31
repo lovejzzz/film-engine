@@ -6,6 +6,7 @@
 
 import bpy
 import film_studio_contract
+import film_studio_render
 
 from bpy.props import (
     BoolProperty,
@@ -70,6 +71,17 @@ class FilmStudioWorkspaceState(PropertyGroup):
     contract_output_uri: StringProperty(name="Approved Output")
     contract_plan_hash: StringProperty(name="Plan Hash")
     contract_inspection_token: StringProperty(name="Inspection Token", options={'HIDDEN'})
+    render_repository_root: StringProperty(name="Repository Root", subtype='DIR_PATH')
+    render_manifest_uri: StringProperty(name="Render Manifest URI")
+    render_evidence_root: StringProperty(name="Evidence Root", subtype='DIR_PATH')
+    render_status: StringProperty(name="Render Status", default="NOT_INSPECTED")
+    render_job_id: StringProperty(name="Render Job ID")
+    render_approval_id: StringProperty(name="Render Approval ID")
+    render_manifest_hash: StringProperty(name="Manifest Hash")
+    render_preview_status: StringProperty(name="Preview Status", default="NOT_INSPECTED")
+    render_final_status: StringProperty(name="Final Status", default="NOT_INSPECTED")
+    render_last_receipt_hash: StringProperty(name="Last Receipt Hash")
+    render_inspection_token: StringProperty(name="Render Inspection Token", options={'HIDDEN'})
 
 
 def active_shot(state):
@@ -214,6 +226,43 @@ class FILMSTUDIO_OT_execute_contract(Operator):
         return {'FINISHED'}
 
 
+class FILMSTUDIO_OT_inspect_render_job(Operator):
+    bl_idname = "film_studio.inspect_render_job"
+    bl_label = "Inspect Approved Render Job"
+    bl_description = "Validate the approved render manifest, source and bounded evidence root without rendering"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        state = context.scene.film_studio
+        state.render_inspection_token = ""
+        state.render_preview_status = "NOT_INSPECTED"
+        state.render_final_status = "NOT_INSPECTED"
+        state.render_last_receipt_hash = ""
+        try:
+            result = film_studio_render.inspect_job(
+                bpy.path.abspath(state.render_repository_root),
+                state.render_manifest_uri,
+                bpy.path.abspath(state.render_evidence_root),
+            )
+        except film_studio_render.RenderContractError as error:
+            state.render_status = f"REJECTED: {error.reason}"
+            state.render_job_id = ""
+            state.render_approval_id = ""
+            state.render_manifest_hash = ""
+            self.report({'ERROR'}, f"{error.reason}: {error}")
+            return {'CANCELLED'}
+        state.render_status = result["status"]
+        state.render_job_id = result["jobId"]
+        state.render_approval_id = result["approvalId"]
+        state.render_manifest_hash = result["manifestHash"]
+        state.render_preview_status = result["previewStatus"]
+        state.render_final_status = result["finalStatus"]
+        state.render_last_receipt_hash = result["lastReceiptHash"]
+        state.render_inspection_token = result["inspectionToken"]
+        self.report({'INFO'}, "Approved render job inspected; render calls: 0")
+        return {'FINISHED'}
+
+
 classes = (
     FilmStudioProjectState,
     FilmStudioSceneState,
@@ -224,6 +273,7 @@ classes = (
     FILMSTUDIO_OT_set_mode,
     FILMSTUDIO_OT_inspect_contract,
     FILMSTUDIO_OT_execute_contract,
+    FILMSTUDIO_OT_inspect_render_job,
 )
 
 

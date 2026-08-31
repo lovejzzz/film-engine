@@ -45,6 +45,7 @@ class TOPBAR_HT_upper_bar(Header):
                 icon='RESTRICT_SELECT_OFF' if shot else 'ADD',
             )
             layout.popover(panel="TOPBAR_PT_film_contract", text="Contract", icon='FILE_TICK')
+            layout.popover(panel="TOPBAR_PT_film_render_job", text="Render", icon='RENDER_ANIMATION')
             mode = layout.operator("film_studio.set_mode", text="Expert Mode", icon='WORKSPACE')
             mode.mode = 'EXPERT'
             return
@@ -142,6 +143,34 @@ class TOPBAR_PT_film_contract(Panel):
         execute = layout.row()
         execute.enabled = state.contract_status == "APPROVED_READY" and bool(state.contract_inspection_token)
         execute.operator("film_studio.execute_contract", icon='CHECKMARK')
+
+
+class TOPBAR_PT_film_render_job(Panel):
+    bl_idname = "TOPBAR_PT_film_render_job"
+    bl_label = "Approved Render Job"
+    bl_space_type = 'TOPBAR'
+    bl_region_type = 'HEADER'
+    bl_ui_units_x = 28
+
+    def draw(self, context):
+        layout = self.layout
+        state = context.scene.film_studio
+        layout.prop(state, "render_repository_root")
+        layout.prop(state, "render_manifest_uri")
+        layout.prop(state, "render_evidence_root")
+        layout.operator("film_studio.inspect_render_job", icon='RENDER_STILL')
+        status = layout.box()
+        status.label(text=f"Status: {state.render_status}")
+        if state.render_job_id:
+            status.label(text=f"Job: {state.render_job_id}")
+            status.label(text=f"Approval: {state.render_approval_id}")
+            status.label(text=f"Manifest: {state.render_manifest_hash[:12]}")
+            status.label(text=f"Preview: {state.render_preview_status}")
+            status.label(text=f"Final: {state.render_final_status}")
+            if state.render_last_receipt_hash:
+                status.label(text=f"Receipt: {state.render_last_receipt_hash[:12]}")
+            status.label(text="Preview / Final: approved profiles only", icon='LOCKED')
+            status.label(text="Python / shell / network: NOT APPROVED", icon='LOCKED')
 
 
 class TOPBAR_PT_tool_fallback(Panel):
@@ -946,6 +975,7 @@ classes = (
     TOPBAR_PT_tool_fallback,
     TOPBAR_PT_tool_settings_extra,
     TOPBAR_PT_film_contract,
+    TOPBAR_PT_film_render_job,
     TOPBAR_PT_gpencil_primitive,
     TOPBAR_PT_name,
     TOPBAR_PT_name_marker,
