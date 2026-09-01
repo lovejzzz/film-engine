@@ -5,6 +5,7 @@
 """Typed film workspace and bounded SceneSpec contract bridge."""
 
 import bpy
+import film_studio_causal
 import film_studio_contract
 import film_studio_render
 
@@ -71,6 +72,19 @@ class FilmStudioWorkspaceState(PropertyGroup):
     contract_output_uri: StringProperty(name="Approved Output")
     contract_plan_hash: StringProperty(name="Plan Hash")
     contract_inspection_token: StringProperty(name="Inspection Token", options={'HIDDEN'})
+    causal_repository_root: StringProperty(name="Repository Root", subtype='DIR_PATH')
+    causal_scene_spec_uri: StringProperty(name="Causal SceneSpec URI")
+    causal_status: StringProperty(name="Physics Status", default="NOT_INSPECTED")
+    causal_scene_id: StringProperty(name="Causal Scene ID")
+    causal_scene_spec_hash: StringProperty(name="Causal SceneSpec Hash")
+    causal_actor_factory: StringProperty(name="Actor Factory")
+    causal_target_factory: StringProperty(name="Target Factory")
+    causal_target_count: IntProperty(name="Target Count", default=0, min=0, max=16)
+    causal_collision_shapes: StringProperty(name="Collision Shapes")
+    causal_final_pose_source: StringProperty(name="Final Pose Source")
+    causal_camera_fit_source: StringProperty(name="Camera Fit Source")
+    causal_result_summary: StringProperty(name="Physics Result")
+    causal_inspection_token: StringProperty(name="Physics Inspection Token", options={'HIDDEN'})
     render_repository_root: StringProperty(name="Repository Root", subtype='DIR_PATH')
     render_manifest_uri: StringProperty(name="Render Manifest URI")
     render_evidence_root: StringProperty(name="Evidence Root", subtype='DIR_PATH')
@@ -239,6 +253,75 @@ class FILMSTUDIO_OT_execute_contract(Operator):
         state.contract_status = result["status"]
         state.contract_inspection_token = ""
         self.report({'INFO'}, f"BuildPlan written: {result['fileSha256'][:12]}")
+        return {'FINISHED'}
+
+
+class FILMSTUDIO_OT_inspect_causal_scene(Operator):
+    bl_idname = "film_studio.inspect_causal_scene"
+    bl_label = "Inspect Physical Scene"
+    bl_description = "Validate allowlisted factories, initial conditions and Bullet-only final-pose authority without changing the scene"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        state = context.scene.film_studio
+        state.causal_inspection_token = ""
+        state.causal_result_summary = ""
+        try:
+            result = film_studio_causal.inspect_causal_scene(
+                bpy.path.abspath(state.causal_repository_root),
+                state.causal_scene_spec_uri,
+            )
+        except film_studio_causal.CausalContractError as error:
+            state.causal_status = f"REJECTED: {error.reason}"
+            state.causal_scene_id = ""
+            state.causal_scene_spec_hash = ""
+            self.report({'ERROR'}, f"{error.reason}: {error}")
+            return {'CANCELLED'}
+        state.causal_status = result["status"]
+        state.causal_scene_id = result["sceneId"]
+        state.causal_scene_spec_hash = result["sceneSpecHash"]
+        state.causal_actor_factory = result["actorFactory"]
+        state.causal_target_factory = result["targetFactory"]
+        state.causal_target_count = result["targetCount"]
+        state.causal_collision_shapes = " / ".join(result["collisionShapes"])
+        state.causal_final_pose_source = result["finalPoseSource"]
+        state.causal_camera_fit_source = result["cameraFitSource"]
+        state.causal_inspection_token = result["inspectionToken"]
+        self.report({'INFO'}, "Physical scene inspected; scene mutations: 0")
+        return {'FINISHED'}
+
+
+class FILMSTUDIO_OT_execute_causal_scene(Operator):
+    bl_idname = "film_studio.execute_causal_scene"
+    bl_label = "Build with Real Physics"
+    bl_description = "Build the inspected causal scene, release it to Bullet and frame the evaluated result"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        state = getattr(context.scene, "film_studio", None)
+        return bool(state and state.causal_status == "APPROVED_READY" and state.causal_inspection_token)
+
+    def execute(self, context):
+        state = context.scene.film_studio
+        try:
+            result = film_studio_causal.execute_causal_scene(
+                bpy.path.abspath(state.causal_repository_root),
+                state.causal_scene_spec_uri,
+                state.causal_inspection_token,
+                context.scene,
+            )
+        except film_studio_causal.CausalContractError as error:
+            state.causal_status = f"REJECTED: {error.reason}"
+            state.causal_inspection_token = ""
+            self.report({'ERROR'}, f"{error.reason}: {error}")
+            return {'CANCELLED'}
+        state.causal_status = result["status"]
+        state.causal_inspection_token = ""
+        response = result["physics"]["targetResponseFrames"]
+        tilts = result["physics"]["finalTiltDegrees"]
+        state.causal_result_summary = f"Responses {list(response.values())}; final tilts {[round(value, 1) for value in tilts.values()]}"
+        self.report({'INFO'}, "Physical scene built; final poses are Bullet evaluated")
         return {'FINISHED'}
 
 
@@ -413,6 +496,8 @@ classes = (
     FILMSTUDIO_OT_set_mode,
     FILMSTUDIO_OT_inspect_contract,
     FILMSTUDIO_OT_execute_contract,
+    FILMSTUDIO_OT_inspect_causal_scene,
+    FILMSTUDIO_OT_execute_causal_scene,
     FILMSTUDIO_OT_inspect_render_job,
     FILMSTUDIO_OT_resume_render_job,
     FILMSTUDIO_OT_inspect_vertical_slice,

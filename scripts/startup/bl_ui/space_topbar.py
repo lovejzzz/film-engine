@@ -45,6 +45,7 @@ class TOPBAR_HT_upper_bar(Header):
                 icon='RESTRICT_SELECT_OFF' if shot else 'ADD',
             )
             layout.popover(panel="TOPBAR_PT_film_contract", text="Contract", icon='FILE_TICK')
+            layout.popover(panel="TOPBAR_PT_film_causal_scene", text="Physics", icon='PHYSICS')
             layout.popover(panel="TOPBAR_PT_film_render_job", text="Render", icon='RENDER_ANIMATION')
             layout.popover(panel="TOPBAR_PT_film_vertical_slice", text="Slice", icon='SEQUENCE')
             mode = layout.operator("film_studio.set_mode", text="Expert Mode", icon='WORKSPACE')
@@ -180,6 +181,38 @@ class TOPBAR_PT_film_render_job(Panel):
             resume.operator("film_studio.resume_render_job", icon='PLAY')
             status.label(text="Preview / Final: approved profiles only", icon='LOCKED')
             status.label(text="Python / shell / network: NOT APPROVED", icon='LOCKED')
+
+
+class TOPBAR_PT_film_causal_scene(Panel):
+    bl_idname = "TOPBAR_PT_film_causal_scene"
+    bl_label = "Physical Causal Scene"
+    bl_space_type = 'TOPBAR'
+    bl_region_type = 'HEADER'
+    bl_ui_units_x = 31
+
+    def draw(self, context):
+        layout = self.layout
+        state = context.scene.film_studio
+        layout.prop(state, "causal_repository_root")
+        layout.prop(state, "causal_scene_spec_uri")
+        layout.operator("film_studio.inspect_causal_scene", icon='VIEWZOOM')
+        status = layout.box()
+        status.label(text=f"Status: {state.causal_status}")
+        if state.causal_scene_id:
+            status.label(text=f"Scene: {state.causal_scene_id}")
+            status.label(text=f"Actor: {state.causal_actor_factory}")
+            status.label(text=f"Targets: {state.causal_target_count} × {state.causal_target_factory}")
+            status.label(text=f"Collisions: {state.causal_collision_shapes}")
+            status.label(text="Initial conditions: DECLARATIVE")
+            status.label(text="Final poses: BLENDER BULLET", icon='PHYSICS')
+            status.label(text="Target/final-pose keyframes: FORBIDDEN", icon='LOCKED')
+            status.label(text="Camera: evaluated result bounds", icon='CAMERA_DATA')
+            status.label(text="Python / shell / network: NOT APPROVED", icon='LOCKED')
+            if state.causal_result_summary:
+                status.label(text=state.causal_result_summary)
+        execute = layout.row()
+        execute.enabled = state.causal_status == "APPROVED_READY" and bool(state.causal_inspection_token)
+        execute.operator("film_studio.execute_causal_scene", icon='PLAY')
 
 
 class TOPBAR_PT_film_vertical_slice(Panel):
@@ -1015,6 +1048,7 @@ classes = (
     TOPBAR_PT_tool_fallback,
     TOPBAR_PT_tool_settings_extra,
     TOPBAR_PT_film_contract,
+    TOPBAR_PT_film_causal_scene,
     TOPBAR_PT_film_render_job,
     TOPBAR_PT_film_vertical_slice,
     TOPBAR_PT_gpencil_primitive,
