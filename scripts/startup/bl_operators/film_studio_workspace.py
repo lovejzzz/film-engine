@@ -7,6 +7,7 @@
 import bpy
 import film_studio_causal
 import film_studio_contract
+import film_studio_physical_performance
 import film_studio_render
 
 from bpy.props import (
@@ -267,11 +268,16 @@ class FILMSTUDIO_OT_inspect_causal_scene(Operator):
         state.causal_inspection_token = ""
         state.causal_result_summary = ""
         try:
-            result = film_studio_causal.inspect_causal_scene(
-                bpy.path.abspath(state.causal_repository_root),
-                state.causal_scene_spec_uri,
-            )
-        except film_studio_causal.CausalContractError as error:
+            root = bpy.path.abspath(state.causal_repository_root)
+            if film_studio_physical_performance.matches_physical_performance(root, state.causal_scene_spec_uri):
+                result = film_studio_physical_performance.inspect_physical_performance(
+                    root,
+                    state.causal_scene_spec_uri,
+                    context.scene,
+                )
+            else:
+                result = film_studio_causal.inspect_causal_scene(root, state.causal_scene_spec_uri)
+        except (film_studio_causal.CausalContractError, film_studio_physical_performance.PhysicalPerformanceError) as error:
             state.causal_status = f"REJECTED: {error.reason}"
             state.causal_scene_id = ""
             state.causal_scene_spec_hash = ""
@@ -305,22 +311,35 @@ class FILMSTUDIO_OT_execute_causal_scene(Operator):
     def execute(self, context):
         state = context.scene.film_studio
         try:
-            result = film_studio_causal.execute_causal_scene(
-                bpy.path.abspath(state.causal_repository_root),
-                state.causal_scene_spec_uri,
-                state.causal_inspection_token,
-                context.scene,
-            )
-        except film_studio_causal.CausalContractError as error:
+            root = bpy.path.abspath(state.causal_repository_root)
+            if film_studio_physical_performance.matches_physical_performance(root, state.causal_scene_spec_uri):
+                result = film_studio_physical_performance.execute_physical_performance(
+                    root,
+                    state.causal_scene_spec_uri,
+                    state.causal_inspection_token,
+                    context.scene,
+                )
+            else:
+                result = film_studio_causal.execute_causal_scene(
+                    root,
+                    state.causal_scene_spec_uri,
+                    state.causal_inspection_token,
+                    context.scene,
+                )
+        except (film_studio_causal.CausalContractError, film_studio_physical_performance.PhysicalPerformanceError) as error:
             state.causal_status = f"REJECTED: {error.reason}"
             state.causal_inspection_token = ""
             self.report({'ERROR'}, f"{error.reason}: {error}")
             return {'CANCELLED'}
         state.causal_status = result["status"]
         state.causal_inspection_token = ""
-        response = result["physics"]["targetResponseFrames"]
-        tilts = result["physics"]["finalTiltDegrees"]
-        state.causal_result_summary = f"Responses {list(response.values())}; final tilts {[round(value, 1) for value in tilts.values()]}"
+        if "mechanism" in result:
+            physics = result["physics"]
+            state.causal_result_summary = f"Contact {physics['contactFrame']}; peak {physics['peakDisplacementMeters']:.3f} m; settled {physics['settledWindowStartFrame']}"
+        else:
+            response = result["physics"]["targetResponseFrames"]
+            tilts = result["physics"]["finalTiltDegrees"]
+            state.causal_result_summary = f"Responses {list(response.values())}; final tilts {[round(value, 1) for value in tilts.values()]}"
         self.report({'INFO'}, "Physical scene built; final poses are Bullet evaluated")
         return {'FINISHED'}
 
