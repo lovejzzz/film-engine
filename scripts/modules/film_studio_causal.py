@@ -17,6 +17,7 @@ import hashlib
 import json
 import math
 import os
+import statistics
 from pathlib import Path
 
 import bpy
@@ -26,8 +27,8 @@ from mathutils import Vector
 import film_studio_contract
 
 
-SPEC_VERSIONS = {"bfs.causalSceneSpec.v0.1", "bfs.causalSceneSpec.v0.2"}
-CONTRACT_VERSION = "bfs.filmStudioCausalContract.v0.2"
+SPEC_VERSIONS = {"bfs.causalSceneSpec.v0.1", "bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4"}
+CONTRACT_VERSION = "bfs.filmStudioCausalContract.v0.3"
 ALLOWED_FACTORIES = {
     "GROOVED_SPHERE",
     "BEVELED_DOMINO_BLOCK",
@@ -139,7 +140,10 @@ def _validate_rigid_body(value, expected_shape):
 
 
 def _validate(document):
-    _exact_keys(document, {"$schema", "schemaVersion", "sceneId", "title", "timeline", "dynamicActor", "targetGroup", "studio", "shots", "acceptance", "forbidden", "sceneSpecHash"}, "/")
+    top_keys = {"$schema", "schemaVersion", "sceneId", "title", "timeline", "dynamicActor", "targetGroup", "studio", "shots", "acceptance", "forbidden", "sceneSpecHash"}
+    if document.get("schemaVersion") == "bfs.causalSceneSpec.v0.4":
+        top_keys.add("cinematography")
+    _exact_keys(document, top_keys, "/")
     _finite_tree(document)
     version = document["schemaVersion"]
     if version not in SPEC_VERSIONS or document["sceneSpecHash"] != _self_hash(document, "sceneSpecHash"):
@@ -172,7 +176,7 @@ def _validate(document):
 
     targets = document["targetGroup"]
     target_keys = {"semanticRole", "factory", "count", "dimensions", "initialPositions", "rigidBody", "modeling", "palette"}
-    if version == "bfs.causalSceneSpec.v0.2":
+    if version in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4"}:
         target_keys.add("deterministicVariation")
     _exact_keys(targets, target_keys, "/targetGroup")
     if targets["semanticRole"] != "target_group" or targets["factory"] != "BEVELED_DOMINO_BLOCK" or targets["factory"] not in ALLOWED_FACTORIES:
@@ -186,11 +190,16 @@ def _validate(document):
         _vector(position, 3, -100.0, 100.0, "target position")
     for color in targets["palette"]:
         _vector(color, 3, 0.0, 1.0, "target color")
-    if version == "bfs.causalSceneSpec.v0.2":
+    if version in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4"}:
         variation = targets["deterministicVariation"]
-        _exact_keys(variation, {"seed", "positionJitterMetersMaximum", "yawJitterDegreesMaximum", "frictionJitterMaximum", "restitutionJitterMaximum"}, "/targetGroup/deterministicVariation")
+        variation_keys = {"seed", "positionJitterMetersMaximum", "yawJitterDegreesMaximum", "frictionJitterMaximum", "restitutionJitterMaximum"}
+        if version == "bfs.causalSceneSpec.v0.4":
+            variation_keys.add("basisSceneSpecHash")
+        _exact_keys(variation, variation_keys, "/targetGroup/deterministicVariation")
         if not isinstance(variation["seed"], int) or isinstance(variation["seed"], bool) or not 0 <= variation["seed"] <= 2147483647:
             raise CausalContractError("SPEC_SCHEMA", "variation seed")
+        if version == "bfs.causalSceneSpec.v0.4" and (not isinstance(variation["basisSceneSpecHash"], str) or len(variation["basisSceneSpecHash"]) != 64 or any(character not in "0123456789abcdef" for character in variation["basisSceneSpecHash"])):
+            raise CausalContractError("SPEC_SCHEMA", "variation basis hash")
         _number(variation["positionJitterMetersMaximum"], 0.0, 0.1, "position jitter")
         _number(variation["yawJitterDegreesMaximum"], 0.0, 10.0, "yaw jitter")
         _number(variation["frictionJitterMaximum"], 0.0, 0.2, "friction jitter")
@@ -206,6 +215,20 @@ def _validate(document):
         raise CausalContractError("UNSUPPORTED_FACTORY", "backdrop")
     if len(studio["lights"]) != 3 or any(light.get("kind") != "AREA" for light in studio["lights"]):
         raise CausalContractError("UNSUPPORTED_FACTORY", "lights")
+    if version == "bfs.causalSceneSpec.v0.4":
+        cinematography = document["cinematography"]
+        _exact_keys(cinematography, {"motionBlur"}, "/cinematography")
+        motion_blur = cinematography["motionBlur"]
+        _exact_keys(motion_blur, {"strategy", "semanticRoles", "measurementResolution", "targetBlurPixels", "minimumShutterFrames", "maximumShutterFrames", "position"}, "/cinematography/motionBlur")
+        if motion_blur["strategy"] != "MEASURED_PROJECTED_MEDIAN_MOTION" or motion_blur["semanticRoles"] != ["dynamic_actor", "target_group"]:
+            raise CausalContractError("SPEC_SCHEMA", "motion blur measurement authority")
+        if motion_blur["measurementResolution"] != [960, 540] or motion_blur["position"] != "CENTER":
+            raise CausalContractError("SPEC_SCHEMA", "motion blur measurement contract")
+        _number(motion_blur["targetBlurPixels"], 1.0, 24.0, "target blur pixels")
+        _number(motion_blur["minimumShutterFrames"], 0.05, 1.0, "minimum shutter")
+        _number(motion_blur["maximumShutterFrames"], 0.05, 1.0, "maximum shutter")
+        if motion_blur["minimumShutterFrames"] > motion_blur["maximumShutterFrames"]:
+            raise CausalContractError("SPEC_SCHEMA", "shutter bounds")
     shots = document["shots"]
     if not isinstance(shots, list) or [shot.get("shotId") for shot in shots] != ["SETUP", "IMPACT", "AFTERMATH"]:
         raise CausalContractError("SPEC_SCHEMA", "shots")
@@ -217,17 +240,20 @@ def _validate(document):
     expected_selections = {
         "bfs.causalSceneSpec.v0.1": ["last frame before first target response", "first target response frame", "frameEnd"],
         "bfs.causalSceneSpec.v0.2": ["last frame before first target response", "peak propagated angular motion frame", "first settled frame after all targets respond"],
+        "bfs.causalSceneSpec.v0.4": ["last frame before first target response", "peak propagated angular motion frame", "first settled frame after all targets respond"],
     }[version]
     if [shot["selection"] for shot in shots] != expected_selections:
         raise CausalContractError("SPEC_SCHEMA", "shot selection")
     acceptance = document["acceptance"]
     acceptance_keys = {"initialPenetrationMaximumMeters", "actorForwardTravelBeforeFirstResponseMinimumMeters", "firstTargetResponseFrameWindowInclusive", "targetTiltDegreesAtFinalMinimumEach", "finiteTransformRequired", "reopenResponseFramesExact", "reopenFinalTiltToleranceDegrees", "postReleaseActorPoseKeyframes", "targetPoseKeyframes", "reviewOccupancyRange", "reviewNegativeSpaceMarginMinimum"}
-    if version == "bfs.causalSceneSpec.v0.2":
+    if version in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4"}:
         acceptance_keys.update({"impactActiveTargetCountMinimum", "impactFrameAfterFirstResponseMinimum", "settleAngularStepDegreesMaximum", "settleConsecutiveFrames", "deterministicVariationRequired", "impactClipFrameCount"})
+    if version == "bfs.causalSceneSpec.v0.4":
+        acceptance_keys.update({"measuredMedianMotionPixelsPerFrameRange", "computedShutterFramesRange", "computedBlurTargetErrorPixelsMaximum", "blurredImpactMustDifferFromSharpControl"})
     _exact_keys(acceptance, acceptance_keys, "/acceptance")
     if acceptance["postReleaseActorPoseKeyframes"] != 0 or acceptance["targetPoseKeyframes"] != 0:
         raise CausalContractError("FINAL_POSE_AUTHORITY", "Final pose keyframes are forbidden")
-    if version == "bfs.causalSceneSpec.v0.2":
+    if version in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4"}:
         if acceptance["deterministicVariationRequired"] is not True:
             raise CausalContractError("SPEC_SCHEMA", "deterministic variation")
         if not isinstance(acceptance["impactActiveTargetCountMinimum"], int) or not 1 <= acceptance["impactActiveTargetCountMinimum"] <= targets["count"]:
@@ -239,8 +265,19 @@ def _validate(document):
             raise CausalContractError("SPEC_SCHEMA", "settle frames")
         if not isinstance(acceptance["impactClipFrameCount"], int) or not 8 <= acceptance["impactClipFrameCount"] <= 96:
             raise CausalContractError("SPEC_SCHEMA", "impact clip frames")
+    if version == "bfs.causalSceneSpec.v0.4":
+        _vector(acceptance["measuredMedianMotionPixelsPerFrameRange"], 2, 0.0, 1000.0, "measured motion range")
+        _vector(acceptance["computedShutterFramesRange"], 2, 0.0, 1.0, "computed shutter range")
+        if acceptance["measuredMedianMotionPixelsPerFrameRange"][0] > acceptance["measuredMedianMotionPixelsPerFrameRange"][1] or acceptance["computedShutterFramesRange"][0] > acceptance["computedShutterFramesRange"][1]:
+            raise CausalContractError("SPEC_SCHEMA", "acceptance ranges")
+        _number(acceptance["computedBlurTargetErrorPixelsMaximum"], 0.0, 1.0, "blur target error")
+        if acceptance["blurredImpactMustDifferFromSharpControl"] is not True:
+            raise CausalContractError("SPEC_SCHEMA", "blurred impact control")
     forbidden = document["forbidden"]
-    _exact_keys(forbidden, {"acceptedBottleFactory", "acceptedBottleFinalCoordinates", "projectSpecificCameraCoordinates", "externalModelsOrTextures", "manualTargetOrFinalPoseAnimation"}, "/forbidden")
+    forbidden_keys = {"acceptedBottleFactory", "acceptedBottleFinalCoordinates", "projectSpecificCameraCoordinates", "externalModelsOrTextures", "manualTargetOrFinalPoseAnimation"}
+    if version == "bfs.causalSceneSpec.v0.4":
+        forbidden_keys.update({"manualShutterValue", "compositorOrPostprocessBlur", "effectCoverForWeakerPrimaryPhysics"})
+    _exact_keys(forbidden, forbidden_keys, "/forbidden")
     if not all(value is True for value in forbidden.values()):
         raise CausalContractError("SPEC_EXECUTABLE_AUTHORITY", "All authority denials must remain true")
     return document
@@ -399,8 +436,9 @@ def _create_targets(document, dark):
         variation = spec.get("deterministicVariation")
         derived = {"positionX": float(position[0]), "positionY": float(position[1]), "yawDegrees": 0.0, "friction": float(spec["rigidBody"]["friction"]), "restitution": float(spec["rigidBody"]["restitution"])}
         if variation:
+            variation_basis = variation.get("basisSceneSpecHash", document["sceneSpecHash"])
             def sample(channel):
-                token = f"{document['sceneSpecHash']}:{variation['seed']}:{index}:{channel}".encode("utf-8")
+                token = f"{variation_basis}:{variation['seed']}:{index}:{channel}".encode("utf-8")
                 integer = int.from_bytes(hashlib.sha256(token).digest()[:8], "big")
                 return integer / (2 ** 64 - 1) * 2.0 - 1.0
             derived["positionX"] += sample("position-x") * variation["positionJitterMetersMaximum"]
@@ -536,7 +574,7 @@ def _simulate(scene, actor, targets, document):
         bpy.context.view_layer.update()
     travel = None if first is None else round(actor.matrix_world.translation.x - initial_actor.x, 8)
     motion_selection = None
-    if document["schemaVersion"] == "bfs.causalSceneSpec.v0.2" and first is not None and all(frame is not None for frame in response.values()):
+    if document["schemaVersion"] in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4"} and first is not None and all(frame is not None for frame in response.values()):
         acceptance = document["acceptance"]
         impact_minimum = first + acceptance["impactFrameAfterFirstResponseMinimum"]
         candidates = [row for row in motion if row["frame"] >= impact_minimum]
@@ -609,6 +647,54 @@ def _fit_camera(scene, camera, objects, desired):
     return {"source": "EVALUATED_FRAME_SEMANTIC_WORLD_BOUNDS", "occupancy": round(observed, 8), "negativeSpaceMargin": round(margin, 8), "cameraLocation": [round(value, 8) for value in camera.location]}
 
 
+def _configure_measured_shutter(scene, camera, objects, impact_frame, document):
+    spec = document["cinematography"]["motionBlur"]
+    width, height = spec["measurementResolution"]
+    projected = {}
+    for frame in (impact_frame - 1, impact_frame):
+        scene.frame_set(frame)
+        bpy.context.view_layer.update()
+        projected[frame] = {}
+        for obj in objects:
+            point = world_to_camera_view(scene, camera, obj.matrix_world.translation)
+            projected[frame][obj.name] = (point.x * width, (1.0 - point.y) * height)
+    speeds = {}
+    for obj in objects:
+        before = projected[impact_frame - 1][obj.name]
+        after = projected[impact_frame][obj.name]
+        speeds[obj.name] = math.hypot(after[0] - before[0], after[1] - before[1])
+    median_speed = statistics.median(speeds.values())
+    if median_speed <= 1e-9:
+        raise CausalContractError("MOTION_BLUR_MEASUREMENT", "Impact projected motion is zero")
+    unclamped = spec["targetBlurPixels"] / median_speed
+    shutter = max(spec["minimumShutterFrames"], min(spec["maximumShutterFrames"], unclamped))
+    shutter = round(shutter, 8)
+    achieved = median_speed * shutter
+    scene.render.use_motion_blur = True
+    scene.render.motion_blur_shutter = shutter
+    scene.render.motion_blur_position = spec["position"]
+    scene.frame_set(impact_frame)
+    bpy.context.view_layer.update()
+    return {
+        "source": "EVALUATED_SEMANTIC_PROJECTED_ORIGIN_MOTION",
+        "strategy": spec["strategy"],
+        "measurementFrame": impact_frame,
+        "measurementInterval": [impact_frame - 1, impact_frame],
+        "measurementResolution": [width, height],
+        "semanticObjectCount": len(objects),
+        "objectPixelsPerFrame": {name: round(value, 8) for name, value in speeds.items()},
+        "medianPixelsPerFrame": round(median_speed, 8),
+        "targetBlurPixels": spec["targetBlurPixels"],
+        "unclampedShutterFrames": round(unclamped, 8),
+        "computedShutterFrames": shutter,
+        "achievedMedianBlurPixels": round(achieved, 8),
+        "targetErrorPixels": round(abs(achieved - spec["targetBlurPixels"]), 8),
+        "position": spec["position"],
+        "nativeTransformMotionBlur": True,
+        "compositorOrPostprocessBlur": False,
+    }
+
+
 def execute_causal_scene(repository_root, scene_spec_uri, inspection_token, scene=None):
     inspection = inspect_causal_scene(repository_root, scene_spec_uri)
     if inspection_token != inspection["inspectionToken"]:
@@ -622,6 +708,7 @@ def execute_causal_scene(repository_root, scene_spec_uri, inspection_token, scen
     scene.render.engine = "BLENDER_EEVEE"
     scene.render.resolution_x, scene.render.resolution_y, scene.render.resolution_percentage = 960, 540, 100
     scene.render.image_settings.file_format, scene.render.image_settings.color_mode = "PNG", "RGBA"
+    scene.render.use_motion_blur = False
     scene.gravity = (0, 0, -9.81)
     if scene.world is None:
         scene.world = bpy.data.worlds.new("FILM_STUDIO_CAUSAL_WORLD")
@@ -637,7 +724,7 @@ def execute_causal_scene(repository_root, scene_spec_uri, inspection_token, scen
         scene.rigidbody_world.point_cache.frame_end = scene.frame_end
     physics = _simulate(scene, actor, targets, document)
     first = physics["firstTargetResponseFrame"]
-    if document["schemaVersion"] == "bfs.causalSceneSpec.v0.2" and physics["motionSelection"]:
+    if document["schemaVersion"] in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4"} and physics["motionSelection"]:
         frames = {"SETUP": max(scene.frame_start, first - 1), "IMPACT": physics["motionSelection"]["impactFrame"], "AFTERMATH": physics["motionSelection"]["aftermathFrame"]}
     else:
         frames = {"SETUP": max(scene.frame_start, first - 2) if first else scene.frame_start, "IMPACT": first or (scene.frame_start + scene.frame_end) // 2, "AFTERMATH": scene.frame_end}
@@ -651,17 +738,32 @@ def execute_causal_scene(repository_root, scene_spec_uri, inspection_token, scen
         record["frame"] = frames[shot_id]
         cameras[shot_id]["film_studio_framing"] = json.dumps(record, sort_keys=True)
         framing[shot_id] = record
+    cinematography = None
+    if document["schemaVersion"] == "bfs.causalSceneSpec.v0.4":
+        cinematography = {
+            "motionBlur": _configure_measured_shutter(
+                scene,
+                cameras["IMPACT"],
+                [actor, *targets],
+                physics["motionSelection"]["impactFrame"],
+                document,
+            )
+        }
     scene.camera = cameras["SETUP"]
     scene.frame_set(scene.frame_start)
+    initial_conditions_record = {
+        "source": "SHA256_SCENE_HASH_SEED_TARGET_INDEX_CHANNEL" if document["schemaVersion"] == "bfs.causalSceneSpec.v0.2" else "DECLARED_EXACT",
+        "targets": initial_conditions,
+    }
+    if document["schemaVersion"] == "bfs.causalSceneSpec.v0.4":
+        initial_conditions_record["source"] = "SHA256_VARIATION_BASIS_HASH_SEED_TARGET_INDEX_CHANNEL"
+        initial_conditions_record["basisSceneSpecHash"] = document["targetGroup"]["deterministicVariation"]["basisSceneSpecHash"]
     result = {
         **inspection,
         "status": "PHYSICS_READY",
         "contractVersion": CONTRACT_VERSION,
         "physics": physics,
-        "initialConditions": {
-            "source": "SHA256_SCENE_HASH_SEED_TARGET_INDEX_CHANNEL" if document["schemaVersion"] == "bfs.causalSceneSpec.v0.2" else "DECLARED_EXACT",
-            "targets": initial_conditions,
-        },
+        "initialConditions": initial_conditions_record,
         "framing": framing,
         "provenance": {
             "finalPoseSource": "BLENDER_BULLET_RIGID_BODY",
@@ -679,6 +781,8 @@ def execute_causal_scene(repository_root, scene_spec_uri, inspection_token, scen
             "environment": wall.name,
         },
     }
+    if cinematography is not None:
+        result["cinematography"] = cinematography
     scene["film_studio_causal_result"] = json.dumps(result, sort_keys=True, separators=(",", ":"))
     scene["film_studio_causal_scene_spec_hash"] = document["sceneSpecHash"]
     return result
