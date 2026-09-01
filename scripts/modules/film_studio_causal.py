@@ -26,8 +26,8 @@ from mathutils import Vector
 import film_studio_contract
 
 
-SPEC_VERSION = "bfs.causalSceneSpec.v0.1"
-CONTRACT_VERSION = "bfs.filmStudioCausalContract.v0.1"
+SPEC_VERSIONS = {"bfs.causalSceneSpec.v0.1", "bfs.causalSceneSpec.v0.2"}
+CONTRACT_VERSION = "bfs.filmStudioCausalContract.v0.2"
 ALLOWED_FACTORIES = {
     "GROOVED_SPHERE",
     "BEVELED_DOMINO_BLOCK",
@@ -141,7 +141,8 @@ def _validate_rigid_body(value, expected_shape):
 def _validate(document):
     _exact_keys(document, {"$schema", "schemaVersion", "sceneId", "title", "timeline", "dynamicActor", "targetGroup", "studio", "shots", "acceptance", "forbidden", "sceneSpecHash"}, "/")
     _finite_tree(document)
-    if document["schemaVersion"] != SPEC_VERSION or document["sceneSpecHash"] != _self_hash(document, "sceneSpecHash"):
+    version = document["schemaVersion"]
+    if version not in SPEC_VERSIONS or document["sceneSpecHash"] != _self_hash(document, "sceneSpecHash"):
         raise CausalContractError("SPEC_HASH", "CausalSceneSpec self hash or version is invalid")
     _exact_keys(document["timeline"], {"fps", "frameStart", "frameEnd", "releaseFrame"}, "/timeline")
     timeline = document["timeline"]
@@ -170,7 +171,10 @@ def _validate(document):
         raise CausalContractError("SPEC_SCHEMA", "actor material")
 
     targets = document["targetGroup"]
-    _exact_keys(targets, {"semanticRole", "factory", "count", "dimensions", "initialPositions", "rigidBody", "modeling", "palette"}, "/targetGroup")
+    target_keys = {"semanticRole", "factory", "count", "dimensions", "initialPositions", "rigidBody", "modeling", "palette"}
+    if version == "bfs.causalSceneSpec.v0.2":
+        target_keys.add("deterministicVariation")
+    _exact_keys(targets, target_keys, "/targetGroup")
     if targets["semanticRole"] != "target_group" or targets["factory"] != "BEVELED_DOMINO_BLOCK" or targets["factory"] not in ALLOWED_FACTORIES:
         raise CausalContractError("UNSUPPORTED_FACTORY", str(targets.get("factory")))
     if not isinstance(targets["count"], int) or not 1 <= targets["count"] <= 16:
@@ -182,6 +186,15 @@ def _validate(document):
         _vector(position, 3, -100.0, 100.0, "target position")
     for color in targets["palette"]:
         _vector(color, 3, 0.0, 1.0, "target color")
+    if version == "bfs.causalSceneSpec.v0.2":
+        variation = targets["deterministicVariation"]
+        _exact_keys(variation, {"seed", "positionJitterMetersMaximum", "yawJitterDegreesMaximum", "frictionJitterMaximum", "restitutionJitterMaximum"}, "/targetGroup/deterministicVariation")
+        if not isinstance(variation["seed"], int) or isinstance(variation["seed"], bool) or not 0 <= variation["seed"] <= 2147483647:
+            raise CausalContractError("SPEC_SCHEMA", "variation seed")
+        _number(variation["positionJitterMetersMaximum"], 0.0, 0.1, "position jitter")
+        _number(variation["yawJitterDegreesMaximum"], 0.0, 10.0, "yaw jitter")
+        _number(variation["frictionJitterMaximum"], 0.0, 0.2, "friction jitter")
+        _number(variation["restitutionJitterMaximum"], 0.0, 0.2, "restitution jitter")
     _validate_rigid_body(targets["rigidBody"], "BOX")
     _exact_keys(targets["modeling"], {"bevelWidth", "bevelSegments", "insetFacePanel", "edgeBand"}, "/targetGroup/modeling")
     if targets["modeling"]["insetFacePanel"] is not True or targets["modeling"]["edgeBand"] is not True:
@@ -201,10 +214,31 @@ def _validate(document):
         if shot["directionClass"] not in DIRECTION_CAMERA:
             raise CausalContractError("UNSUPPORTED_FACTORY", "camera direction")
         _number(shot["targetOccupancy"], 0.3, 0.85, "target occupancy")
+    expected_selections = {
+        "bfs.causalSceneSpec.v0.1": ["last frame before first target response", "first target response frame", "frameEnd"],
+        "bfs.causalSceneSpec.v0.2": ["last frame before first target response", "peak propagated angular motion frame", "first settled frame after all targets respond"],
+    }[version]
+    if [shot["selection"] for shot in shots] != expected_selections:
+        raise CausalContractError("SPEC_SCHEMA", "shot selection")
     acceptance = document["acceptance"]
-    _exact_keys(acceptance, {"initialPenetrationMaximumMeters", "actorForwardTravelBeforeFirstResponseMinimumMeters", "firstTargetResponseFrameWindowInclusive", "targetTiltDegreesAtFinalMinimumEach", "finiteTransformRequired", "reopenResponseFramesExact", "reopenFinalTiltToleranceDegrees", "postReleaseActorPoseKeyframes", "targetPoseKeyframes", "reviewOccupancyRange", "reviewNegativeSpaceMarginMinimum"}, "/acceptance")
+    acceptance_keys = {"initialPenetrationMaximumMeters", "actorForwardTravelBeforeFirstResponseMinimumMeters", "firstTargetResponseFrameWindowInclusive", "targetTiltDegreesAtFinalMinimumEach", "finiteTransformRequired", "reopenResponseFramesExact", "reopenFinalTiltToleranceDegrees", "postReleaseActorPoseKeyframes", "targetPoseKeyframes", "reviewOccupancyRange", "reviewNegativeSpaceMarginMinimum"}
+    if version == "bfs.causalSceneSpec.v0.2":
+        acceptance_keys.update({"impactActiveTargetCountMinimum", "impactFrameAfterFirstResponseMinimum", "settleAngularStepDegreesMaximum", "settleConsecutiveFrames", "deterministicVariationRequired", "impactClipFrameCount"})
+    _exact_keys(acceptance, acceptance_keys, "/acceptance")
     if acceptance["postReleaseActorPoseKeyframes"] != 0 or acceptance["targetPoseKeyframes"] != 0:
         raise CausalContractError("FINAL_POSE_AUTHORITY", "Final pose keyframes are forbidden")
+    if version == "bfs.causalSceneSpec.v0.2":
+        if acceptance["deterministicVariationRequired"] is not True:
+            raise CausalContractError("SPEC_SCHEMA", "deterministic variation")
+        if not isinstance(acceptance["impactActiveTargetCountMinimum"], int) or not 1 <= acceptance["impactActiveTargetCountMinimum"] <= targets["count"]:
+            raise CausalContractError("SPEC_SCHEMA", "impact active target count")
+        if not isinstance(acceptance["impactFrameAfterFirstResponseMinimum"], int) or not 1 <= acceptance["impactFrameAfterFirstResponseMinimum"] <= 120:
+            raise CausalContractError("SPEC_SCHEMA", "impact frame delay")
+        _number(acceptance["settleAngularStepDegreesMaximum"], 0.0, 5.0, "settle angular step")
+        if not isinstance(acceptance["settleConsecutiveFrames"], int) or not 2 <= acceptance["settleConsecutiveFrames"] <= 48:
+            raise CausalContractError("SPEC_SCHEMA", "settle frames")
+        if not isinstance(acceptance["impactClipFrameCount"], int) or not 8 <= acceptance["impactClipFrameCount"] <= 96:
+            raise CausalContractError("SPEC_SCHEMA", "impact clip frames")
     forbidden = document["forbidden"]
     _exact_keys(forbidden, {"acceptedBottleFactory", "acceptedBottleFinalCoordinates", "projectSpecificCameraCoordinates", "externalModelsOrTextures", "manualTargetOrFinalPoseAnimation"}, "/forbidden")
     if not all(value is True for value in forbidden.values()):
@@ -360,9 +394,24 @@ def _create_actor(document, dark):
 def _create_targets(document, dark):
     spec = document["targetGroup"]
     dimensions = tuple(spec["dimensions"])
-    targets, details = [], []
+    targets, details, initial_conditions = [], [], []
     for index, (position, color) in enumerate(zip(spec["initialPositions"], spec["palette"]), 1):
-        bpy.ops.mesh.primitive_cube_add(location=tuple(position))
+        variation = spec.get("deterministicVariation")
+        derived = {"positionX": float(position[0]), "positionY": float(position[1]), "yawDegrees": 0.0, "friction": float(spec["rigidBody"]["friction"]), "restitution": float(spec["rigidBody"]["restitution"])}
+        if variation:
+            def sample(channel):
+                token = f"{document['sceneSpecHash']}:{variation['seed']}:{index}:{channel}".encode("utf-8")
+                integer = int.from_bytes(hashlib.sha256(token).digest()[:8], "big")
+                return integer / (2 ** 64 - 1) * 2.0 - 1.0
+            derived["positionX"] += sample("position-x") * variation["positionJitterMetersMaximum"]
+            derived["positionY"] += sample("position-y") * variation["positionJitterMetersMaximum"]
+            derived["yawDegrees"] = sample("yaw") * variation["yawJitterDegreesMaximum"]
+            derived["friction"] = max(0.0, min(1.0, derived["friction"] + sample("friction") * variation["frictionJitterMaximum"]))
+            derived["restitution"] = max(0.0, min(1.0, derived["restitution"] + sample("restitution") * variation["restitutionJitterMaximum"]))
+        derived = {key: round(value, 8) for key, value in derived.items()}
+        target_position = (derived["positionX"], derived["positionY"], float(position[2]))
+        yaw = math.radians(derived["yawDegrees"])
+        bpy.ops.mesh.primitive_cube_add(location=target_position, rotation=(0.0, 0.0, yaw))
         target = bpy.context.object
         target.name = f"CAUSAL_TARGET_{index:03d}"
         target.dimensions = dimensions
@@ -374,7 +423,8 @@ def _create_targets(document, dark):
         bevel.width = spec["modeling"]["bevelWidth"]
         bevel.segments = spec["modeling"]["bevelSegments"]
         panel_material = _material(f"MAT_CausalPanel_{index:02d}", tuple(min(1.0, value * 1.28) for value in color), 0.28)
-        bpy.ops.mesh.primitive_cube_add(location=(position[0], position[1] - dimensions[1] / 2 - 0.012, position[2]))
+        panel_position = target.matrix_world @ Vector((0.0, -dimensions[1] / 2 - 0.012, 0.0))
+        bpy.ops.mesh.primitive_cube_add(location=panel_position, rotation=(0.0, 0.0, yaw))
         panel = bpy.context.object
         panel.name = f"CAUSAL_DETAIL_TargetPanel_{index:02d}"
         panel.dimensions = (dimensions[0] * 0.72, 0.018, dimensions[2] * 0.44)
@@ -384,7 +434,8 @@ def _create_targets(document, dark):
         panel_bevel = panel.modifiers.new("Panel_Bevel", "BEVEL")
         panel_bevel.width, panel_bevel.segments = 0.018, 3
         _preserve_parent(panel, target)
-        bpy.ops.mesh.primitive_cube_add(location=(position[0], position[1], position[2] - dimensions[2] * 0.29))
+        band_position = target.matrix_world @ Vector((0.0, 0.0, -dimensions[2] * 0.29))
+        bpy.ops.mesh.primitive_cube_add(location=band_position, rotation=(0.0, 0.0, yaw))
         band = bpy.context.object
         band.name = f"CAUSAL_DETAIL_TargetBand_{index:02d}"
         band.dimensions = (dimensions[0] + 0.012, dimensions[1] + 0.012, 0.055)
@@ -392,10 +443,12 @@ def _create_targets(document, dark):
         band.data.materials.append(dark)
         band["film_studio_semantic_role"] = "modeling_detail"
         _preserve_parent(band, target)
-        _add_rigid_body(target, "ACTIVE", spec["rigidBody"])
+        body_spec = {**spec["rigidBody"], "friction": derived["friction"], "restitution": derived["restitution"]}
+        _add_rigid_body(target, "ACTIVE", body_spec)
+        initial_conditions.append({"target": target.name, **derived})
         targets.append(target)
         details.extend((panel, band))
-    return targets, details
+    return targets, details, initial_conditions
 
 
 def _create_studio(document):
@@ -452,25 +505,66 @@ def _tilt(obj):
 
 def _simulate(scene, actor, targets, document):
     initial_actor = Vector(document["dynamicActor"]["initialPosition"])
+    scene.frame_set(document["timeline"]["frameStart"])
+    bpy.context.view_layer.update()
     initial = {obj.name: obj.matrix_world.translation.copy() for obj in targets}
     response = {obj.name: None for obj in targets}
+    previous_tilts = {obj.name: _tilt(obj) for obj in targets}
+    motion = []
     for frame in range(document["timeline"]["frameStart"], document["timeline"]["frameEnd"] + 1):
         scene.frame_set(frame)
         bpy.context.view_layer.update()
+        angular_steps = {}
         for target in targets:
             location = target.matrix_world.translation
+            tilt = _tilt(target)
+            angular_steps[target.name] = abs(tilt - previous_tilts[target.name])
+            previous_tilts[target.name] = tilt
             displacement = (Vector((location.x, location.y)) - Vector((initial[target.name].x, initial[target.name].y))).length
-            if response[target.name] is None and (_tilt(target) >= 1.0 or displacement >= 0.012):
+            if response[target.name] is None and (tilt >= 1.0 or displacement >= 0.012):
                 response[target.name] = frame
+        motion.append({
+            "frame": frame,
+            "activeTargetCount": sum(step >= 0.25 for step in angular_steps.values()),
+            "aggregateAngularStepDegrees": round(sum(angular_steps.values()), 8),
+            "targetAngularStepDegrees": {name: round(value, 8) for name, value in angular_steps.items()},
+        })
     final_tilts = {obj.name: round(_tilt(obj), 8) for obj in targets}
     first = min((frame for frame in response.values() if frame is not None), default=None)
     if first is not None:
         scene.frame_set(first)
         bpy.context.view_layer.update()
     travel = None if first is None else round(actor.matrix_world.translation.x - initial_actor.x, 8)
+    motion_selection = None
+    if document["schemaVersion"] == "bfs.causalSceneSpec.v0.2" and first is not None and all(frame is not None for frame in response.values()):
+        acceptance = document["acceptance"]
+        impact_minimum = first + acceptance["impactFrameAfterFirstResponseMinimum"]
+        candidates = [row for row in motion if row["frame"] >= impact_minimum]
+        impact = max(candidates, key=lambda row: (row["activeTargetCount"], row["aggregateAngularStepDegrees"], -row["frame"]))
+        settle_start = max(response.values())
+        settle_count = acceptance["settleConsecutiveFrames"]
+        settle_limit = acceptance["settleAngularStepDegreesMaximum"]
+        aftermath = document["timeline"]["frameEnd"]
+        for offset, row in enumerate(motion):
+            window = motion[offset:offset + settle_count]
+            if row["frame"] >= settle_start and len(window) == settle_count and all(sample["aggregateAngularStepDegrees"] <= settle_limit for sample in window):
+                aftermath = row["frame"]
+                break
+        motion_selection = {
+            "source": "EVALUATED_TARGET_WORLD_TILT_DELTAS",
+            "impactRule": "MAX_ACTIVE_TARGETS_THEN_AGGREGATE_ANGULAR_STEP_THEN_EARLIEST",
+            "impactFrame": impact["frame"],
+            "impactActiveTargetCount": impact["activeTargetCount"],
+            "impactAggregateAngularStepDegrees": impact["aggregateAngularStepDegrees"],
+            "impactTargetAngularStepDegrees": impact["targetAngularStepDegrees"],
+            "aftermathRule": "FIRST_POST_RESPONSE_SETTLED_WINDOW_ELSE_FRAME_END",
+            "aftermathFrame": aftermath,
+            "settleConsecutiveFrames": settle_count,
+            "settleAngularStepDegreesMaximum": settle_limit,
+        }
     scene.frame_set(document["timeline"]["frameEnd"])
     bpy.context.view_layer.update()
-    return {"firstTargetResponseFrame": first, "targetResponseFrames": response, "finalTiltDegrees": final_tilts, "actorForwardTravelBeforeFirstResponse": travel}
+    return {"firstTargetResponseFrame": first, "targetResponseFrames": response, "finalTiltDegrees": final_tilts, "actorForwardTravelBeforeFirstResponse": travel, "motionSamples": motion, "motionSelection": motion_selection}
 
 
 def _projected_bounds(scene, camera, objects):
@@ -534,7 +628,7 @@ def execute_causal_scene(repository_root, scene_spec_uri, inspection_token, scen
     scene.world.color = (0.012, 0.015, 0.025)
     floor, wall, lights, dark = _create_studio(document)
     actor, actor_details = _create_actor(document, dark)
-    targets, target_details = _create_targets(document, dark)
+    targets, target_details, initial_conditions = _create_targets(document, dark)
     cameras = _create_cameras(document)
     if scene.rigidbody_world:
         scene.rigidbody_world.substeps_per_frame = 10
@@ -543,7 +637,10 @@ def execute_causal_scene(repository_root, scene_spec_uri, inspection_token, scen
         scene.rigidbody_world.point_cache.frame_end = scene.frame_end
     physics = _simulate(scene, actor, targets, document)
     first = physics["firstTargetResponseFrame"]
-    frames = {"SETUP": max(scene.frame_start, first - 2) if first else scene.frame_start, "IMPACT": first or (scene.frame_start + scene.frame_end) // 2, "AFTERMATH": scene.frame_end}
+    if document["schemaVersion"] == "bfs.causalSceneSpec.v0.2" and physics["motionSelection"]:
+        frames = {"SETUP": max(scene.frame_start, first - 1), "IMPACT": physics["motionSelection"]["impactFrame"], "AFTERMATH": physics["motionSelection"]["aftermathFrame"]}
+    else:
+        frames = {"SETUP": max(scene.frame_start, first - 2) if first else scene.frame_start, "IMPACT": first or (scene.frame_start + scene.frame_end) // 2, "AFTERMATH": scene.frame_end}
     narrative = [actor, *actor_details, *targets, *target_details]
     framing = {}
     for shot in document["shots"]:
@@ -561,6 +658,10 @@ def execute_causal_scene(repository_root, scene_spec_uri, inspection_token, scen
         "status": "PHYSICS_READY",
         "contractVersion": CONTRACT_VERSION,
         "physics": physics,
+        "initialConditions": {
+            "source": "SHA256_SCENE_HASH_SEED_TARGET_INDEX_CHANNEL" if document["schemaVersion"] == "bfs.causalSceneSpec.v0.2" else "DECLARED_EXACT",
+            "targets": initial_conditions,
+        },
         "framing": framing,
         "provenance": {
             "finalPoseSource": "BLENDER_BULLET_RIGID_BODY",
