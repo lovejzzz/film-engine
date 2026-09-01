@@ -27,16 +27,17 @@ from mathutils import Vector
 import film_studio_contract
 
 
-SPEC_VERSIONS = {"bfs.causalSceneSpec.v0.1", "bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4"}
-CONTRACT_VERSION = "bfs.filmStudioCausalContract.v0.3"
+SPEC_VERSIONS = {"bfs.causalSceneSpec.v0.1", "bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4", "bfs.causalSceneSpec.v0.5"}
+CONTRACT_VERSION = "bfs.filmStudioCausalContract.v0.4"
 ALLOWED_FACTORIES = {
     "GROOVED_SPHERE",
     "BEVELED_DOMINO_BLOCK",
+    "FILLED_LATHED_BOTTLE",
     "SIMPLE_WALL",
     "AREA_LIGHT",
     "CAMERA_FROM_DIRECTION_CLASS",
 }
-ALLOWED_COLLISION_SHAPES = {"SPHERE", "BOX"}
+ALLOWED_COLLISION_SHAPES = {"SPHERE", "BOX", "CONVEX_HULL"}
 DIRECTION_CAMERA = {
     "FRONT_LEFT_HIGH": ((-5.5, -6.0, 3.0), (0.0, 0.0, 0.55)),
     "FRONT_LEFT_LOW": ((-3.0, -5.4, 1.8), (0.2, 0.0, 0.55)),
@@ -139,9 +140,101 @@ def _validate_rigid_body(value, expected_shape):
         _number(value[key], 0.0, 1.0, key)
 
 
+def _physical_identity(document):
+    actor = document["dynamicActor"]
+    targets = document["targetGroup"]
+    return {
+        "dynamicActor": {
+            "radius": actor["radius"],
+            "initialPosition": actor["initialPosition"],
+            "launchWaypoints": actor["launchWaypoints"],
+            "rigidBody": actor["rigidBody"],
+        },
+        "targetGroup": {
+            "factory": targets["factory"],
+            "count": targets["count"],
+            "initialBasePositions": targets["initialBasePositions"],
+            "physicalArchetype": targets["physicalArchetype"],
+            "rigidBody": targets["rigidBody"],
+        },
+    }
+
+
+def _validate_metric_rigid_body(value, expected_shape, actor=False):
+    keys = {"collisionShape", "collisionMarginMeters", "friction", "restitution", "linearDamping", "angularDamping"}
+    if actor:
+        keys.add("mass")
+    _exact_keys(value, keys, "/rigidBody")
+    if value["collisionShape"] != expected_shape or value["collisionShape"] not in ALLOWED_COLLISION_SHAPES:
+        raise CausalContractError("UNSUPPORTED_COLLISION_SHAPE", value["collisionShape"])
+    if actor:
+        _number(value["mass"], 0.001, 1000.0, "mass")
+    _number(value["collisionMarginMeters"], 0.0001, 0.01, "collision margin")
+    for key in ("friction", "restitution", "linearDamping", "angularDamping"):
+        _number(value[key], 0.0, 1.0, key)
+
+
+def _validate_metric_bottles(targets):
+    _exact_keys(targets, {"semanticRole", "factory", "count", "initialBasePositions", "physicalArchetype", "rigidBody", "modeling", "deterministicVariation", "bodyPalette", "labelPalette", "liquidPalette"}, "/targetGroup")
+    if targets["semanticRole"] != "target_group" or targets["factory"] != "FILLED_LATHED_BOTTLE" or targets["count"] != 3:
+        raise CausalContractError("UNSUPPORTED_FACTORY", str(targets.get("factory")))
+    for key in ("initialBasePositions", "bodyPalette", "labelPalette", "liquidPalette"):
+        if not isinstance(targets[key], list) or len(targets[key]) != targets["count"]:
+            raise CausalContractError("TARGET_COUNT_OUT_OF_RANGE", key)
+    for position in targets["initialBasePositions"]:
+        _vector(position, 3, -100.0, 100.0, "target base position")
+    for palette in (targets["bodyPalette"], targets["labelPalette"], targets["liquidPalette"]):
+        for color in palette:
+            _vector(color, 3, 0.0, 1.0, "target color")
+    archetype = targets["physicalArchetype"]
+    _exact_keys(archetype, {"heightMeters", "bodyRadiusMeters", "neckRadiusMeters", "interiorBaseHeightMeters", "liquidBodyHeightMeters", "containerMassKg", "nominalCapacityLiters", "liquidDensityKgPerLiter", "containerCenterOfMassHeightRatio", "fillFractions", "massStrategy", "centerOfMassStrategy"}, "/targetGroup/physicalArchetype")
+    for key in ("heightMeters", "bodyRadiusMeters", "neckRadiusMeters", "interiorBaseHeightMeters", "liquidBodyHeightMeters", "containerMassKg", "nominalCapacityLiters", "liquidDensityKgPerLiter"):
+        _number(archetype[key], 0.0001, 10.0, key)
+    _number(archetype["containerCenterOfMassHeightRatio"], 0.05, 0.95, "container COM ratio")
+    if not archetype["bodyRadiusMeters"] > archetype["neckRadiusMeters"] or archetype["liquidBodyHeightMeters"] > archetype["heightMeters"]:
+        raise CausalContractError("SPEC_SCHEMA", "bottle proportions")
+    if archetype["massStrategy"] != "CONTAINER_PLUS_LIQUID_FROM_FILL" or archetype["centerOfMassStrategy"] != "WEIGHTED_CONTAINER_AND_LIQUID_COLUMN":
+        raise CausalContractError("SPEC_SCHEMA", "derived physical strategy")
+    if not isinstance(archetype["fillFractions"], list) or len(archetype["fillFractions"]) != targets["count"]:
+        raise CausalContractError("TARGET_COUNT_OUT_OF_RANGE", "fill fractions")
+    for fill in archetype["fillFractions"]:
+        _number(fill, 0.01, 0.99, "fill fraction")
+    if len({round(fill, 8) for fill in archetype["fillFractions"]}) != targets["count"]:
+        raise CausalContractError("SPEC_SCHEMA", "fill levels must be distinct")
+    _validate_metric_rigid_body(targets["rigidBody"], "CONVEX_HULL")
+    modeling = targets["modeling"]
+    _exact_keys(modeling, {"profileSegments", "profileMeters", "wallThicknessMeters", "capHeightMeters", "capRadiusMeters", "capRidgeCount", "labelHeightRatio", "requiredReadableStages"}, "/targetGroup/modeling")
+    if not isinstance(modeling["profileSegments"], int) or not 24 <= modeling["profileSegments"] <= 128 or not isinstance(modeling["capRidgeCount"], int) or not 8 <= modeling["capRidgeCount"] <= 64:
+        raise CausalContractError("SPEC_SCHEMA", "bottle segments")
+    if not isinstance(modeling["profileMeters"], list) or not 6 <= len(modeling["profileMeters"]) <= 32:
+        raise CausalContractError("SPEC_SCHEMA", "bottle profile")
+    previous_height = -1.0
+    for radius, height in modeling["profileMeters"]:
+        _number(radius, 0.001, archetype["bodyRadiusMeters"] * 1.1, "profile radius")
+        _number(height, 0.0, archetype["heightMeters"], "profile height")
+        if height <= previous_height:
+            raise CausalContractError("SPEC_SCHEMA", "profile height order")
+        previous_height = height
+    if abs(modeling["profileMeters"][-1][1] - archetype["heightMeters"]) > 1e-9:
+        raise CausalContractError("SPEC_SCHEMA", "profile height exact")
+    for key in ("wallThicknessMeters", "capHeightMeters", "capRadiusMeters", "labelHeightRatio"):
+        _number(modeling[key], 0.0001, 1.0, key)
+    if modeling["requiredReadableStages"] != ["base", "body", "shoulder", "neck", "cap", "label", "liquid_fill"]:
+        raise CausalContractError("SPEC_SCHEMA", "readable bottle stages")
+
+
+def _derive_bottle_physics(archetype, fill_fraction):
+    liquid_mass = archetype["nominalCapacityLiters"] * archetype["liquidDensityKgPerLiter"] * fill_fraction
+    total_mass = archetype["containerMassKg"] + liquid_mass
+    container_com = archetype["heightMeters"] * archetype["containerCenterOfMassHeightRatio"]
+    liquid_com = archetype["interiorBaseHeightMeters"] + archetype["liquidBodyHeightMeters"] * fill_fraction / 2.0
+    center_of_mass = (archetype["containerMassKg"] * container_com + liquid_mass * liquid_com) / total_mass
+    return round(total_mass, 8), round(center_of_mass, 8), round(liquid_com, 8)
+
+
 def _validate(document):
     top_keys = {"$schema", "schemaVersion", "sceneId", "title", "timeline", "dynamicActor", "targetGroup", "studio", "shots", "acceptance", "forbidden", "sceneSpecHash"}
-    if document.get("schemaVersion") == "bfs.causalSceneSpec.v0.4":
+    if document.get("schemaVersion") in {"bfs.causalSceneSpec.v0.4", "bfs.causalSceneSpec.v0.5"}:
         top_keys.add("cinematography")
     _exact_keys(document, top_keys, "/")
     _finite_tree(document)
@@ -168,46 +261,54 @@ def _validate(document):
         previous = waypoint["frame"]
         _vector(waypoint["position"], 3, -100.0, 100.0, "waypoint position")
         _number(waypoint["rotationY"], -1000.0, 1000.0, "waypoint rotation")
-    _validate_rigid_body(actor["rigidBody"], "SPHERE")
+    if version == "bfs.causalSceneSpec.v0.5":
+        _validate_metric_rigid_body(actor["rigidBody"], "SPHERE", actor=True)
+    else:
+        _validate_rigid_body(actor["rigidBody"], "SPHERE")
     _exact_keys(actor["material"], {"baseColor", "roughness", "proceduralGrain", "channelCount"}, "/dynamicActor/material")
     _vector(actor["material"]["baseColor"], 3, 0.0, 1.0, "actor color")
     if actor["material"]["proceduralGrain"] is not True or actor["material"]["channelCount"] != 3:
         raise CausalContractError("SPEC_SCHEMA", "actor material")
 
     targets = document["targetGroup"]
-    target_keys = {"semanticRole", "factory", "count", "dimensions", "initialPositions", "rigidBody", "modeling", "palette"}
-    if version in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4"}:
-        target_keys.add("deterministicVariation")
-    _exact_keys(targets, target_keys, "/targetGroup")
-    if targets["semanticRole"] != "target_group" or targets["factory"] != "BEVELED_DOMINO_BLOCK" or targets["factory"] not in ALLOWED_FACTORIES:
-        raise CausalContractError("UNSUPPORTED_FACTORY", str(targets.get("factory")))
-    if not isinstance(targets["count"], int) or not 1 <= targets["count"] <= 16:
-        raise CausalContractError("TARGET_COUNT_OUT_OF_RANGE", str(targets.get("count")))
-    if len(targets["initialPositions"]) != targets["count"] or len(targets["palette"]) != targets["count"]:
-        raise CausalContractError("TARGET_COUNT_OUT_OF_RANGE", "positions/palette")
-    _vector(targets["dimensions"], 3, 0.02, 10.0, "target dimensions")
-    for position in targets["initialPositions"]:
-        _vector(position, 3, -100.0, 100.0, "target position")
-    for color in targets["palette"]:
-        _vector(color, 3, 0.0, 1.0, "target color")
-    if version in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4"}:
+    if version == "bfs.causalSceneSpec.v0.5":
+        _validate_metric_bottles(targets)
+    else:
+        target_keys = {"semanticRole", "factory", "count", "dimensions", "initialPositions", "rigidBody", "modeling", "palette"}
+        if version in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4"}:
+            target_keys.add("deterministicVariation")
+        _exact_keys(targets, target_keys, "/targetGroup")
+        if targets["semanticRole"] != "target_group" or targets["factory"] != "BEVELED_DOMINO_BLOCK" or targets["factory"] not in ALLOWED_FACTORIES:
+            raise CausalContractError("UNSUPPORTED_FACTORY", str(targets.get("factory")))
+        if not isinstance(targets["count"], int) or not 1 <= targets["count"] <= 16:
+            raise CausalContractError("TARGET_COUNT_OUT_OF_RANGE", str(targets.get("count")))
+        if len(targets["initialPositions"]) != targets["count"] or len(targets["palette"]) != targets["count"]:
+            raise CausalContractError("TARGET_COUNT_OUT_OF_RANGE", "positions/palette")
+        _vector(targets["dimensions"], 3, 0.02, 10.0, "target dimensions")
+        for position in targets["initialPositions"]:
+            _vector(position, 3, -100.0, 100.0, "target position")
+        for color in targets["palette"]:
+            _vector(color, 3, 0.0, 1.0, "target color")
+        _validate_rigid_body(targets["rigidBody"], "BOX")
+        _exact_keys(targets["modeling"], {"bevelWidth", "bevelSegments", "insetFacePanel", "edgeBand"}, "/targetGroup/modeling")
+        if targets["modeling"]["insetFacePanel"] is not True or targets["modeling"]["edgeBand"] is not True:
+            raise CausalContractError("SPEC_SCHEMA", "target modeling")
+    if version in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4", "bfs.causalSceneSpec.v0.5"}:
         variation = targets["deterministicVariation"]
         variation_keys = {"seed", "positionJitterMetersMaximum", "yawJitterDegreesMaximum", "frictionJitterMaximum", "restitutionJitterMaximum"}
-        if version == "bfs.causalSceneSpec.v0.4":
+        if version in {"bfs.causalSceneSpec.v0.4", "bfs.causalSceneSpec.v0.5"}:
             variation_keys.add("basisSceneSpecHash")
         _exact_keys(variation, variation_keys, "/targetGroup/deterministicVariation")
         if not isinstance(variation["seed"], int) or isinstance(variation["seed"], bool) or not 0 <= variation["seed"] <= 2147483647:
             raise CausalContractError("SPEC_SCHEMA", "variation seed")
-        if version == "bfs.causalSceneSpec.v0.4" and (not isinstance(variation["basisSceneSpecHash"], str) or len(variation["basisSceneSpecHash"]) != 64 or any(character not in "0123456789abcdef" for character in variation["basisSceneSpecHash"])):
+        if version in {"bfs.causalSceneSpec.v0.4", "bfs.causalSceneSpec.v0.5"} and (not isinstance(variation["basisSceneSpecHash"], str) or len(variation["basisSceneSpecHash"]) != 64 or any(character not in "0123456789abcdef" for character in variation["basisSceneSpecHash"])):
             raise CausalContractError("SPEC_SCHEMA", "variation basis hash")
         _number(variation["positionJitterMetersMaximum"], 0.0, 0.1, "position jitter")
         _number(variation["yawJitterDegreesMaximum"], 0.0, 10.0, "yaw jitter")
         _number(variation["frictionJitterMaximum"], 0.0, 0.2, "friction jitter")
         _number(variation["restitutionJitterMaximum"], 0.0, 0.2, "restitution jitter")
-    _validate_rigid_body(targets["rigidBody"], "BOX")
-    _exact_keys(targets["modeling"], {"bevelWidth", "bevelSegments", "insetFacePanel", "edgeBand"}, "/targetGroup/modeling")
-    if targets["modeling"]["insetFacePanel"] is not True or targets["modeling"]["edgeBand"] is not True:
-        raise CausalContractError("SPEC_SCHEMA", "target modeling")
+        if version == "bfs.causalSceneSpec.v0.5" and variation["basisSceneSpecHash"] != _sha256(_canonical(_physical_identity(document)).encode("utf-8")):
+            raise CausalContractError("SPEC_HASH", "physical variation basis differs")
 
     studio = document["studio"]
     _exact_keys(studio, {"ground", "backdrop", "lights"}, "/studio")
@@ -215,7 +316,7 @@ def _validate(document):
         raise CausalContractError("UNSUPPORTED_FACTORY", "backdrop")
     if len(studio["lights"]) != 3 or any(light.get("kind") != "AREA" for light in studio["lights"]):
         raise CausalContractError("UNSUPPORTED_FACTORY", "lights")
-    if version == "bfs.causalSceneSpec.v0.4":
+    if version in {"bfs.causalSceneSpec.v0.4", "bfs.causalSceneSpec.v0.5"}:
         cinematography = document["cinematography"]
         _exact_keys(cinematography, {"motionBlur"}, "/cinematography")
         motion_blur = cinematography["motionBlur"]
@@ -241,19 +342,22 @@ def _validate(document):
         "bfs.causalSceneSpec.v0.1": ["last frame before first target response", "first target response frame", "frameEnd"],
         "bfs.causalSceneSpec.v0.2": ["last frame before first target response", "peak propagated angular motion frame", "first settled frame after all targets respond"],
         "bfs.causalSceneSpec.v0.4": ["last frame before first target response", "peak propagated angular motion frame", "first settled frame after all targets respond"],
+        "bfs.causalSceneSpec.v0.5": ["last frame before first target response", "peak propagated angular motion frame", "first settled frame after all targets respond"],
     }[version]
     if [shot["selection"] for shot in shots] != expected_selections:
         raise CausalContractError("SPEC_SCHEMA", "shot selection")
     acceptance = document["acceptance"]
     acceptance_keys = {"initialPenetrationMaximumMeters", "actorForwardTravelBeforeFirstResponseMinimumMeters", "firstTargetResponseFrameWindowInclusive", "targetTiltDegreesAtFinalMinimumEach", "finiteTransformRequired", "reopenResponseFramesExact", "reopenFinalTiltToleranceDegrees", "postReleaseActorPoseKeyframes", "targetPoseKeyframes", "reviewOccupancyRange", "reviewNegativeSpaceMarginMinimum"}
-    if version in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4"}:
+    if version in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4", "bfs.causalSceneSpec.v0.5"}:
         acceptance_keys.update({"impactActiveTargetCountMinimum", "impactFrameAfterFirstResponseMinimum", "settleAngularStepDegreesMaximum", "settleConsecutiveFrames", "deterministicVariationRequired", "impactClipFrameCount"})
-    if version == "bfs.causalSceneSpec.v0.4":
+    if version in {"bfs.causalSceneSpec.v0.4", "bfs.causalSceneSpec.v0.5"}:
         acceptance_keys.update({"measuredMedianMotionPixelsPerFrameRange", "computedShutterFramesRange", "computedBlurTargetErrorPixelsMaximum", "blurredImpactMustDifferFromSharpControl"})
+    if version == "bfs.causalSceneSpec.v0.5":
+        acceptance_keys.update({"targetsTiltedAtLeast60DegreesMinimumCount", "metricScaleRequired", "derivedMassesKgExact", "derivedCenterOfMassHeightsMetersExact", "recognizableBottleDetailObjectsMinimumEach", "distinctVisibleFillLevelsMinimum", "collisionShapeMustMatchVisibleBottleHull"})
     _exact_keys(acceptance, acceptance_keys, "/acceptance")
     if acceptance["postReleaseActorPoseKeyframes"] != 0 or acceptance["targetPoseKeyframes"] != 0:
         raise CausalContractError("FINAL_POSE_AUTHORITY", "Final pose keyframes are forbidden")
-    if version in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4"}:
+    if version in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4", "bfs.causalSceneSpec.v0.5"}:
         if acceptance["deterministicVariationRequired"] is not True:
             raise CausalContractError("SPEC_SCHEMA", "deterministic variation")
         if not isinstance(acceptance["impactActiveTargetCountMinimum"], int) or not 1 <= acceptance["impactActiveTargetCountMinimum"] <= targets["count"]:
@@ -265,7 +369,7 @@ def _validate(document):
             raise CausalContractError("SPEC_SCHEMA", "settle frames")
         if not isinstance(acceptance["impactClipFrameCount"], int) or not 8 <= acceptance["impactClipFrameCount"] <= 96:
             raise CausalContractError("SPEC_SCHEMA", "impact clip frames")
-    if version == "bfs.causalSceneSpec.v0.4":
+    if version in {"bfs.causalSceneSpec.v0.4", "bfs.causalSceneSpec.v0.5"}:
         _vector(acceptance["measuredMedianMotionPixelsPerFrameRange"], 2, 0.0, 1000.0, "measured motion range")
         _vector(acceptance["computedShutterFramesRange"], 2, 0.0, 1.0, "computed shutter range")
         if acceptance["measuredMedianMotionPixelsPerFrameRange"][0] > acceptance["measuredMedianMotionPixelsPerFrameRange"][1] or acceptance["computedShutterFramesRange"][0] > acceptance["computedShutterFramesRange"][1]:
@@ -273,10 +377,20 @@ def _validate(document):
         _number(acceptance["computedBlurTargetErrorPixelsMaximum"], 0.0, 1.0, "blur target error")
         if acceptance["blurredImpactMustDifferFromSharpControl"] is not True:
             raise CausalContractError("SPEC_SCHEMA", "blurred impact control")
+    if version == "bfs.causalSceneSpec.v0.5":
+        if acceptance["metricScaleRequired"] is not True or acceptance["collisionShapeMustMatchVisibleBottleHull"] is not True:
+            raise CausalContractError("SPEC_SCHEMA", "metric physical archetype")
+        derived = [_derive_bottle_physics(targets["physicalArchetype"], fill) for fill in targets["physicalArchetype"]["fillFractions"]]
+        if acceptance["derivedMassesKgExact"] != [row[0] for row in derived] or acceptance["derivedCenterOfMassHeightsMetersExact"] != [row[1] for row in derived]:
+            raise CausalContractError("SPEC_SCHEMA", "frozen derived physical values")
+        if acceptance["targetsTiltedAtLeast60DegreesMinimumCount"] not in range(1, targets["count"] + 1) or acceptance["recognizableBottleDetailObjectsMinimumEach"] < 4 or acceptance["distinctVisibleFillLevelsMinimum"] != targets["count"]:
+            raise CausalContractError("SPEC_SCHEMA", "physical archetype acceptance")
     forbidden = document["forbidden"]
     forbidden_keys = {"acceptedBottleFactory", "acceptedBottleFinalCoordinates", "projectSpecificCameraCoordinates", "externalModelsOrTextures", "manualTargetOrFinalPoseAnimation"}
     if version == "bfs.causalSceneSpec.v0.4":
         forbidden_keys.update({"manualShutterValue", "compositorOrPostprocessBlur", "effectCoverForWeakerPrimaryPhysics"})
+    if version == "bfs.causalSceneSpec.v0.5":
+        forbidden_keys = {"acceptedBottleFinalCoordinates", "projectSpecificCameraCoordinates", "externalModelsOrTextures", "manualTargetOrFinalPoseAnimation", "manualShutterValue", "compositorOrPostprocessBlur", "effectCoverForWeakerPrimaryPhysics", "manualPerTargetMassOrCenterOfMass", "nonMetricScaleSubstitution", "decorativeCollisionProxyThatDiffersFromVisibleBottle", "liquidSimulationClaim"}
     _exact_keys(forbidden, forbidden_keys, "/forbidden")
     if not all(value is True for value in forbidden.values()):
         raise CausalContractError("SPEC_EXECUTABLE_AUTHORITY", "All authority denials must remain true")
@@ -364,7 +478,7 @@ def _add_rigid_body(obj, kind, spec):
     body.linear_damping = spec.get("linearDamping", 0.04)
     body.angular_damping = spec.get("angularDamping", 0.1)
     body.use_margin = True
-    body.collision_margin = 0.002
+    body.collision_margin = spec.get("collisionMarginMeters", 0.002)
     obj.select_set(False)
     return body
 
@@ -402,8 +516,11 @@ def _create_actor(document, dark):
     actor["film_studio_factory"] = spec["factory"]
     _smooth(actor)
     details = []
+    metric_actor = document["schemaVersion"] == "bfs.causalSceneSpec.v0.5"
+    seam_radius = radius * 0.022 if metric_actor else 0.009
+    seam_major_radius = radius + seam_radius * 0.2 if metric_actor else radius + 0.002
     for index, rotation in enumerate(((0, 0, 0), (math.pi / 2, 0, 0), (0, math.pi / 2, 0)), 1):
-        bpy.ops.mesh.primitive_torus_add(major_radius=radius + 0.002, minor_radius=0.009, major_segments=96, minor_segments=10, location=location, rotation=rotation)
+        bpy.ops.mesh.primitive_torus_add(major_radius=seam_major_radius, minor_radius=seam_radius, major_segments=96, minor_segments=10, location=location, rotation=rotation)
         seam = bpy.context.object
         seam.name = f"CAUSAL_DETAIL_ActorChannel_{index:02d}"
         seam.data.materials.append(dark)
@@ -428,8 +545,155 @@ def _create_actor(document, dark):
     return actor, details
 
 
+def _lathed_mesh(name, profile, segments, center_of_mass):
+    vertices = []
+    for radius, height in profile:
+        for index in range(segments):
+            angle = 2.0 * math.pi * index / segments
+            vertices.append((radius * math.cos(angle), radius * math.sin(angle), height - center_of_mass))
+    faces = []
+    for ring in range(len(profile) - 1):
+        for index in range(segments):
+            nxt = (index + 1) % segments
+            a = ring * segments + index
+            b = ring * segments + nxt
+            c = (ring + 1) * segments + nxt
+            d = (ring + 1) * segments + index
+            faces.append((a, b, c, d))
+    bottom = len(vertices)
+    top = bottom + 1
+    vertices.extend(((0.0, 0.0, profile[0][1] - center_of_mass), (0.0, 0.0, profile[-1][1] - center_of_mass)))
+    for index in range(segments):
+        nxt = (index + 1) % segments
+        faces.append((bottom, nxt, index))
+        top_a = (len(profile) - 1) * segments + index
+        top_b = (len(profile) - 1) * segments + nxt
+        faces.append((top, top_a, top_b))
+    mesh = bpy.data.meshes.new(f"{name}_MESH")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    return mesh
+
+
+def _bottle_shell_material(name, color):
+    material = bpy.data.materials.new(name)
+    material.use_nodes = True
+    nodes = material.node_tree.nodes
+    nodes.clear()
+    output = nodes.new("ShaderNodeOutputMaterial")
+    glass = nodes.new("ShaderNodeBsdfGlass")
+    glass.inputs["Color"].default_value = (*color, 1.0)
+    glass.inputs["Roughness"].default_value = 0.12
+    glass.inputs["IOR"].default_value = 1.46
+    material.node_tree.links.new(glass.outputs["BSDF"], output.inputs["Surface"])
+    material.diffuse_color = (*color, 1.0)
+    material.use_screen_refraction = True
+    material.use_raytrace_refraction = True
+    return material
+
+
+def _create_metric_bottle_targets(document, dark):
+    spec = document["targetGroup"]
+    archetype = spec["physicalArchetype"]
+    modeling = spec["modeling"]
+    targets, details, initial_conditions = [], [], []
+    for index, (base, body_color, label_color, liquid_color, fill) in enumerate(zip(spec["initialBasePositions"], spec["bodyPalette"], spec["labelPalette"], spec["liquidPalette"], archetype["fillFractions"]), 1):
+        variation = spec["deterministicVariation"]
+        def sample(channel):
+            token = f"{variation['basisSceneSpecHash']}:{variation['seed']}:{index}:{channel}".encode("utf-8")
+            integer = int.from_bytes(hashlib.sha256(token).digest()[:8], "big")
+            return integer / (2 ** 64 - 1) * 2.0 - 1.0
+        position_x = base[0] + sample("position-x") * variation["positionJitterMetersMaximum"]
+        position_y = base[1] + sample("position-y") * variation["positionJitterMetersMaximum"]
+        yaw_degrees = sample("yaw") * variation["yawJitterDegreesMaximum"]
+        friction = max(0.0, min(1.0, spec["rigidBody"]["friction"] + sample("friction") * variation["frictionJitterMaximum"]))
+        restitution = max(0.0, min(1.0, spec["rigidBody"]["restitution"] + sample("restitution") * variation["restitutionJitterMaximum"]))
+        mass, center_of_mass, liquid_center = _derive_bottle_physics(archetype, fill)
+        yaw = math.radians(yaw_degrees)
+        location = (position_x, position_y, base[2] + center_of_mass)
+        mesh = _lathed_mesh(f"CAUSAL_TARGET_{index:03d}", modeling["profileMeters"], modeling["profileSegments"], center_of_mass)
+        target = bpy.data.objects.new(f"CAUSAL_TARGET_{index:03d}", mesh)
+        bpy.context.collection.objects.link(target)
+        target.location = location
+        target.rotation_euler.z = yaw
+        target.data.materials.append(_bottle_shell_material(f"MAT_CausalBottleShell_{index:02d}", tuple(body_color)))
+        target["film_studio_semantic_role"] = "target_group"
+        target["film_studio_factory"] = spec["factory"]
+        target["film_studio_fill_fraction"] = fill
+        target["film_studio_mass_kg"] = mass
+        target["film_studio_center_of_mass_height_m"] = center_of_mass
+        target["film_studio_collision_visible_body_match"] = True
+        _smooth(target)
+        bevel = target.modifiers.new("Bottle_Edge_Soften", "BEVEL")
+        bevel.width, bevel.segments = modeling["wallThicknessMeters"], 2
+        solidify = target.modifiers.new("Bottle_Wall_Thickness", "SOLIDIFY")
+        solidify.thickness = modeling["wallThicknessMeters"]
+
+        fill_height = archetype["liquidBodyHeightMeters"] * fill
+        bpy.ops.mesh.primitive_cylinder_add(vertices=modeling["profileSegments"], radius=archetype["bodyRadiusMeters"] * 0.86, depth=fill_height, location=(position_x, position_y, base[2] + archetype["interiorBaseHeightMeters"] + fill_height / 2.0), rotation=(0.0, 0.0, yaw))
+        liquid = bpy.context.object
+        liquid.name = f"CAUSAL_DETAIL_BottleLiquid_{index:02d}"
+        liquid.data.materials.append(_material(f"MAT_CausalBottleLiquid_{index:02d}", tuple(liquid_color), 0.2))
+        liquid["film_studio_semantic_role"] = "physical_state_detail"
+        liquid["film_studio_fill_fraction"] = fill
+        liquid_bevel = liquid.modifiers.new("Liquid_Meniscus_Edge", "BEVEL")
+        liquid_bevel.width, liquid_bevel.segments = modeling["wallThicknessMeters"] * 0.5, 2
+        _preserve_parent(liquid, target)
+
+        label_height = archetype["heightMeters"] * modeling["labelHeightRatio"]
+        label_center = archetype["heightMeters"] * 0.45
+        bpy.ops.mesh.primitive_cylinder_add(vertices=modeling["profileSegments"], radius=archetype["bodyRadiusMeters"] + modeling["wallThicknessMeters"] * 0.6, depth=label_height, location=(position_x, position_y, base[2] + label_center), rotation=(0.0, 0.0, yaw))
+        label = bpy.context.object
+        label.name = f"CAUSAL_DETAIL_BottleLabel_{index:02d}"
+        label.data.materials.append(_material(f"MAT_CausalBottleLabel_{index:02d}", tuple(label_color), 0.34))
+        label["film_studio_semantic_role"] = "modeling_detail"
+        _preserve_parent(label, target)
+
+        cap_center = base[2] + archetype["heightMeters"] - modeling["capHeightMeters"] / 2.0
+        bpy.ops.mesh.primitive_cylinder_add(vertices=modeling["capRidgeCount"] * 2, radius=modeling["capRadiusMeters"], depth=modeling["capHeightMeters"], location=(position_x, position_y, cap_center), rotation=(0.0, 0.0, yaw))
+        cap = bpy.context.object
+        cap.name = f"CAUSAL_DETAIL_BottleCap_{index:02d}"
+        cap.data.materials.append(dark)
+        cap["film_studio_semantic_role"] = "modeling_detail"
+        cap["film_studio_cap_ridge_count"] = modeling["capRidgeCount"]
+        cap_bevel = cap.modifiers.new("Cap_Edge", "BEVEL")
+        cap_bevel.width, cap_bevel.segments = modeling["wallThicknessMeters"] * 1.5, 2
+        _preserve_parent(cap, target)
+
+        bpy.ops.mesh.primitive_torus_add(major_radius=archetype["bodyRadiusMeters"] * 0.88, minor_radius=modeling["wallThicknessMeters"], major_segments=modeling["profileSegments"], minor_segments=8, location=(position_x, position_y, base[2] + modeling["wallThicknessMeters"] * 2.0), rotation=(0.0, 0.0, yaw))
+        base_ring = bpy.context.object
+        base_ring.name = f"CAUSAL_DETAIL_BottleBaseRing_{index:02d}"
+        base_ring.data.materials.append(dark)
+        base_ring["film_studio_semantic_role"] = "modeling_detail"
+        _preserve_parent(base_ring, target)
+
+        body_spec = {**spec["rigidBody"], "mass": mass, "friction": friction, "restitution": restitution}
+        _add_rigid_body(target, "ACTIVE", body_spec)
+        initial_conditions.append({
+            "target": target.name,
+            "basePosition": [round(position_x, 8), round(position_y, 8), round(base[2], 8)],
+            "yawDegrees": round(yaw_degrees, 8),
+            "fillFraction": round(fill, 8),
+            "derivedMassKg": mass,
+            "derivedCenterOfMassHeightMeters": center_of_mass,
+            "liquidCenterOfMassHeightMeters": liquid_center,
+            "visibleLiquidSurfaceHeightMeters": round(archetype["interiorBaseHeightMeters"] + fill_height, 8),
+            "friction": round(friction, 8),
+            "restitution": round(restitution, 8),
+            "collisionShape": body_spec["collisionShape"],
+            "collisionMarginMeters": body_spec["collisionMarginMeters"],
+            "visibleBodyIsCollisionHullSource": True,
+            "detailObjectCount": 4,
+        })
+        targets.append(target)
+        details.extend((liquid, label, cap, base_ring))
+    return targets, details, initial_conditions
+
+
 def _create_targets(document, dark):
     spec = document["targetGroup"]
+    if spec["factory"] == "FILLED_LATHED_BOTTLE":
+        return _create_metric_bottle_targets(document, dark)
     dimensions = tuple(spec["dimensions"])
     targets, details, initial_conditions = [], [], []
     for index, (position, color) in enumerate(zip(spec["initialPositions"], spec["palette"]), 1):
@@ -574,7 +838,7 @@ def _simulate(scene, actor, targets, document):
         bpy.context.view_layer.update()
     travel = None if first is None else round(actor.matrix_world.translation.x - initial_actor.x, 8)
     motion_selection = None
-    if document["schemaVersion"] in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4"} and first is not None and all(frame is not None for frame in response.values()):
+    if document["schemaVersion"] in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4", "bfs.causalSceneSpec.v0.5"} and first is not None and all(frame is not None for frame in response.values()):
         acceptance = document["acceptance"]
         impact_minimum = first + acceptance["impactFrameAfterFirstResponseMinimum"]
         candidates = [row for row in motion if row["frame"] >= impact_minimum]
@@ -713,6 +977,8 @@ def execute_causal_scene(repository_root, scene_spec_uri, inspection_token, scen
     if scene.world is None:
         scene.world = bpy.data.worlds.new("FILM_STUDIO_CAUSAL_WORLD")
     scene.world.color = (0.012, 0.015, 0.025)
+    if document["schemaVersion"] == "bfs.causalSceneSpec.v0.5" and hasattr(scene, "eevee") and hasattr(scene.eevee, "use_raytracing"):
+        scene.eevee.use_raytracing = True
     floor, wall, lights, dark = _create_studio(document)
     actor, actor_details = _create_actor(document, dark)
     targets, target_details, initial_conditions = _create_targets(document, dark)
@@ -724,7 +990,7 @@ def execute_causal_scene(repository_root, scene_spec_uri, inspection_token, scen
         scene.rigidbody_world.point_cache.frame_end = scene.frame_end
     physics = _simulate(scene, actor, targets, document)
     first = physics["firstTargetResponseFrame"]
-    if document["schemaVersion"] in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4"} and physics["motionSelection"]:
+    if document["schemaVersion"] in {"bfs.causalSceneSpec.v0.2", "bfs.causalSceneSpec.v0.4", "bfs.causalSceneSpec.v0.5"} and physics["motionSelection"]:
         frames = {"SETUP": max(scene.frame_start, first - 1), "IMPACT": physics["motionSelection"]["impactFrame"], "AFTERMATH": physics["motionSelection"]["aftermathFrame"]}
     else:
         frames = {"SETUP": max(scene.frame_start, first - 2) if first else scene.frame_start, "IMPACT": first or (scene.frame_start + scene.frame_end) // 2, "AFTERMATH": scene.frame_end}
@@ -739,7 +1005,7 @@ def execute_causal_scene(repository_root, scene_spec_uri, inspection_token, scen
         cameras[shot_id]["film_studio_framing"] = json.dumps(record, sort_keys=True)
         framing[shot_id] = record
     cinematography = None
-    if document["schemaVersion"] == "bfs.causalSceneSpec.v0.4":
+    if document["schemaVersion"] in {"bfs.causalSceneSpec.v0.4", "bfs.causalSceneSpec.v0.5"}:
         cinematography = {
             "motionBlur": _configure_measured_shutter(
                 scene,
@@ -755,7 +1021,7 @@ def execute_causal_scene(repository_root, scene_spec_uri, inspection_token, scen
         "source": "SHA256_SCENE_HASH_SEED_TARGET_INDEX_CHANNEL" if document["schemaVersion"] == "bfs.causalSceneSpec.v0.2" else "DECLARED_EXACT",
         "targets": initial_conditions,
     }
-    if document["schemaVersion"] == "bfs.causalSceneSpec.v0.4":
+    if document["schemaVersion"] in {"bfs.causalSceneSpec.v0.4", "bfs.causalSceneSpec.v0.5"}:
         initial_conditions_record["source"] = "SHA256_VARIATION_BASIS_HASH_SEED_TARGET_INDEX_CHANNEL"
         initial_conditions_record["basisSceneSpecHash"] = document["targetGroup"]["deterministicVariation"]["basisSceneSpecHash"]
     result = {
@@ -783,6 +1049,21 @@ def execute_causal_scene(repository_root, scene_spec_uri, inspection_token, scen
     }
     if cinematography is not None:
         result["cinematography"] = cinematography
+    if document["schemaVersion"] == "bfs.causalSceneSpec.v0.5":
+        result["physicalArchetypes"] = {
+            "units": {"length": "meter", "mass": "kilogram", "capacity": "liter"},
+            "actor": {
+                "kind": "basketball",
+                "radiusMeters": document["dynamicActor"]["radius"],
+                "massKg": document["dynamicActor"]["rigidBody"]["mass"],
+                "collisionShape": actor.rigid_body.collision_shape,
+                "collisionMarginMeters": round(actor.rigid_body.collision_margin, 8),
+            },
+            "targets": initial_conditions,
+            "massAndCenterOfMassSource": "VISIBLE_FILL_FRACTION_DERIVATION",
+            "visibleBodyIsCollisionHullSource": all(row["visibleBodyIsCollisionHullSource"] for row in initial_conditions),
+            "liquidSimulationClaim": False,
+        }
     scene["film_studio_causal_result"] = json.dumps(result, sort_keys=True, separators=(",", ":"))
     scene["film_studio_causal_scene_spec_hash"] = document["sceneSpecHash"]
     return result
