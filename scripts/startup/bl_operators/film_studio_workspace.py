@@ -7,6 +7,7 @@
 import bpy
 import film_studio_causal
 import film_studio_contract
+import film_studio_physics_action
 import film_studio_physical_light
 import film_studio_physical_performance
 import film_studio_render
@@ -270,7 +271,12 @@ class FILMSTUDIO_OT_inspect_causal_scene(Operator):
         state.causal_result_summary = ""
         try:
             root = bpy.path.abspath(state.causal_repository_root)
-            if film_studio_physical_light.matches_physical_light(root, state.causal_scene_spec_uri):
+            if film_studio_physics_action.matches_physics_action(root, state.causal_scene_spec_uri):
+                result = film_studio_physics_action.inspect_physics_action(
+                    root,
+                    state.causal_scene_spec_uri,
+                )
+            elif film_studio_physical_light.matches_physical_light(root, state.causal_scene_spec_uri):
                 result = film_studio_physical_light.inspect_physical_light(
                     root,
                     state.causal_scene_spec_uri,
@@ -283,7 +289,7 @@ class FILMSTUDIO_OT_inspect_causal_scene(Operator):
                 )
             else:
                 result = film_studio_causal.inspect_causal_scene(root, state.causal_scene_spec_uri)
-        except (film_studio_causal.CausalContractError, film_studio_physical_light.PhysicalLightError, film_studio_physical_performance.PhysicalPerformanceError) as error:
+        except (film_studio_causal.CausalContractError, film_studio_physics_action.PhysicsActionError, film_studio_physical_light.PhysicalLightError, film_studio_physical_performance.PhysicalPerformanceError) as error:
             state.causal_status = f"REJECTED: {error.reason}"
             state.causal_scene_id = ""
             state.causal_scene_spec_hash = ""
@@ -318,7 +324,14 @@ class FILMSTUDIO_OT_execute_causal_scene(Operator):
         state = context.scene.film_studio
         try:
             root = bpy.path.abspath(state.causal_repository_root)
-            if film_studio_physical_light.matches_physical_light(root, state.causal_scene_spec_uri):
+            if film_studio_physics_action.matches_physics_action(root, state.causal_scene_spec_uri):
+                result = film_studio_physics_action.execute_physics_action(
+                    root,
+                    state.causal_scene_spec_uri,
+                    state.causal_inspection_token,
+                    context.scene,
+                )
+            elif film_studio_physical_light.matches_physical_light(root, state.causal_scene_spec_uri):
                 result = film_studio_physical_light.execute_physical_light(
                     root,
                     state.causal_scene_spec_uri,
@@ -339,14 +352,20 @@ class FILMSTUDIO_OT_execute_causal_scene(Operator):
                     state.causal_inspection_token,
                     context.scene,
                 )
-        except (film_studio_causal.CausalContractError, film_studio_physical_light.PhysicalLightError, film_studio_physical_performance.PhysicalPerformanceError) as error:
+        except (film_studio_causal.CausalContractError, film_studio_physics_action.PhysicsActionError, film_studio_physical_light.PhysicalLightError, film_studio_physical_performance.PhysicalPerformanceError) as error:
             state.causal_status = f"REJECTED: {error.reason}"
             state.causal_inspection_token = ""
             self.report({'ERROR'}, f"{error.reason}: {error}")
             return {'CANCELLED'}
         state.causal_status = result["status"]
         state.causal_inspection_token = ""
-        if result.get("schemaVersion") == "bfs.physicalLightResult.v0.1":
+        if result.get("schemaVersion") == "bfs.physicsActionResult.v0.1":
+            physics = result["physics"]
+            if result["topology"] == "HINGE_LIGHT":
+                state.causal_result_summary = f"Graph contact {physics['contactFrame']}; gate {physics['peakShutterOpenDegrees']:.1f} deg; Bullet + geometry light"
+            else:
+                state.causal_result_summary = f"Graph contact {physics['contactFrame']}; {physics['respondingTargetCount']} physical responses; Bullet final poses"
+        elif result.get("schemaVersion") == "bfs.physicalLightResult.v0.1":
             physics = result["physics"]
             state.causal_result_summary = f"Contact {physics['contactFrame']}; gate {physics['peakShutterOpenDegrees']:.1f} deg; reveal geometry-owned"
         elif "mechanism" in result:
