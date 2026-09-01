@@ -27,6 +27,7 @@ from mathutils import Vector
 import film_studio_causal as causal
 import film_studio_contract
 import film_studio_physical_light as light_build
+import film_studio_physical_look as physical_look
 import film_studio_physical_performance as direction
 
 
@@ -324,6 +325,7 @@ def _validate(document):
             "FIRST_CONTACT": {"id", "deriveFrom", "relation"},
             "PEAK_ANGULAR_RESPONSE": {"id", "deriveFrom", "node", "afterBeat"},
             "PEAK_GROUP_RESPONSE": {"id", "deriveFrom", "node", "afterBeat"},
+            "SETTLED_GROUP_RESPONSE": {"id", "deriveFrom", "node", "afterBeat"},
         }.get(derive)
         if keys is None:
             raise PhysicsActionError("SPEC_SCHEMA", "beat derivation")
@@ -343,7 +345,7 @@ def _validate(document):
         raise PhysicsActionError("SPEC_SCHEMA", "cause/contact/effect beats")
     cinema = document["cinematography"]
     _exact(cinema, {"policy", "reviewResolution", "clipFrameCount", "motionBlur"}, "/cinematography")
-    if cinema["policy"] != "SEMANTIC_CAUSE_CONTACT_EFFECT" or cinema["reviewResolution"] != [960, 540] or cinema["clipFrameCount"] != 48:
+    if cinema["policy"] != "SEMANTIC_CAUSE_CONTACT_EFFECT" or cinema["reviewResolution"] not in ([960, 540], [1280, 720]) or cinema["clipFrameCount"] != 48:
         raise PhysicsActionError("SPEC_SCHEMA", "cinematography")
     blur = cinema["motionBlur"]
     _exact(blur, {"source", "targetBlurPixels", "position"}, "/cinematography/motionBlur")
@@ -361,6 +363,8 @@ def _validate(document):
     )
     if not supported:
         raise PhysicsActionError("UNSUPPORTED_TOPOLOGY", ",".join(sorted(topology)))
+    if any(beat["deriveFrom"] == "SETTLED_GROUP_RESPONSE" for beat in document["beats"]) and "PROPAGATES_RESPONSE_WITHIN" not in topology:
+        raise PhysicsActionError("BEAT_DEPENDENCY", "settled response requires a response group")
     return document
 
 
@@ -586,6 +590,18 @@ def _bottle_document(document, actor_node, bottles_node):
     bases = [[group[i] + position[i] for i in range(3)] for position in bp["initialBasePositions"]]
     profile = [[body_radius * ratio, height * z] for ratio, z in ((.88, 0), (1, .03), (1, .63), (.97, .73), (.74, .81), (.43, .88), (.4, .97), (.43, 1))]
     rigid = bottles_node["rigidBody"]
+    realism = bp["materialPreset"] == "HOUSEHOLD_GLASS_WITH_VISIBLE_FILL_AND_VARIATION"
+    variation = {
+        "basisSceneSpecHash": document["physicsActionSpecHash"],
+        "seed": 84017 if realism else 31337,
+        "positionJitterMetersMaximum": .006 if realism else 0,
+        "yawJitterDegreesMaximum": 4 if realism else 0,
+        "frictionJitterMaximum": .025 if realism else 0,
+        "restitutionJitterMaximum": .015 if realism else 0,
+    }
+    body_palette = [[.16, .23, .19], [.18, .21, .17], [.13, .2, .2]] if realism else [[.76, .9, .94], [.9, .82, .62], [.78, .9, .72]]
+    label_palette = [[.64, .095, .045], [.045, .22, .42], [.55, .31, .055]] if realism else [[.92, .38, .06], [.03, .42, .68], [.68, .12, .28]]
+    liquid_palette = [[.055, .23, .12], [.44, .16, .028], [.09, .25, .31]] if realism else [[.15, .52, .78], [.92, .56, .08], [.22, .62, .31]]
     return {
         "schemaVersion": "bfs.causalSceneSpec.v0.5",
         "sceneSpecHash": document["physicsActionSpecHash"],
@@ -605,10 +621,10 @@ def _bottle_document(document, actor_node, bottles_node):
             "physicalArchetype": {"heightMeters": height, "bodyRadiusMeters": body_radius, "neckRadiusMeters": body_radius * .43, "interiorBaseHeightMeters": height * .0214, "liquidBodyHeightMeters": height * .6964, "containerMassKg": .038, "nominalCapacityLiters": .65, "liquidDensityKgPerLiter": .998, "containerCenterOfMassHeightRatio": .48, "fillFractions": bp["fillFractions"], "massStrategy": "CONTAINER_PLUS_LIQUID_FROM_FILL", "centerOfMassStrategy": "WEIGHTED_CONTAINER_AND_LIQUID_COLUMN"},
             "rigidBody": {"collisionShape": "CONVEX_HULL", "collisionMarginMeters": .0007, "friction": rigid["friction"], "restitution": rigid["restitution"], "linearDamping": rigid["linearDamping"], "angularDamping": rigid["angularDamping"]},
             "modeling": {"profileSegments": 64, "profileMeters": profile, "wallThicknessMeters": .0014, "capHeightMeters": height * .064, "capRadiusMeters": body_radius * .47, "capRidgeCount": 24, "labelHeightRatio": .25, "requiredReadableStages": ["base", "body", "shoulder", "neck", "cap", "label", "liquid_fill"]},
-            "deterministicVariation": {"basisSceneSpecHash": document["physicsActionSpecHash"], "seed": 31337, "positionJitterMetersMaximum": 0, "yawJitterDegreesMaximum": 0, "frictionJitterMaximum": 0, "restitutionJitterMaximum": 0},
-            "bodyPalette": [[.76, .9, .94], [.9, .82, .62], [.78, .9, .72]][:bp["count"]],
-            "labelPalette": [[.92, .38, .06], [.03, .42, .68], [.68, .12, .28]][:bp["count"]],
-            "liquidPalette": [[.15, .52, .78], [.92, .56, .08], [.22, .62, .31]][:bp["count"]],
+            "deterministicVariation": variation,
+            "bodyPalette": body_palette[:bp["count"]],
+            "labelPalette": label_palette[:bp["count"]],
+            "liquidPalette": liquid_palette[:bp["count"]],
         },
     }
 
@@ -622,13 +638,30 @@ def _build_bottle_graph(scene, document):
     synthetic = _bottle_document(document, actor_node, bottles_node)
     actor, actor_details = causal._create_actor(synthetic, dark)
     _tag(actor, actor_node["id"], actor_node["semanticRole"])
+    ball_look = None
+    if actor_node["parameters"]["materialPreset"] == "WORN_GAME_BASKETBALL":
+        ball_look = physical_look.enhance_basketball(actor)
     targets, target_details, derived = causal._create_metric_bottle_targets(synthetic, dark)
     for target in targets:
         _tag(target, bottles_node["id"], bottles_node["semanticRole"])
+    bottle_look = None
+    if bottles_node["parameters"]["materialPreset"] == "HOUSEHOLD_GLASS_WITH_VISIBLE_FILL_AND_VARIATION":
+        bottle_look = physical_look.enhance_glass_bottles(
+            targets,
+            target_details,
+            derived,
+            bottles_node["parameters"]["heightMeters"],
+            bottles_node["parameters"]["bodyRadiusMeters"],
+            synthetic["targetGroup"]["modeling"]["wallThicknessMeters"],
+        )
+        target_details.extend(bottle_look["addedObjects"])
     fp = floor_node["parameters"]
     floor = light_build._box("ACTION_GROUND", floor_node["initialCondition"]["location"], (fp["widthMeters"] / 2, fp["depthMeters"] / 2, fp["thicknessMeters"] / 2), causal._material("MAT_Action_Ground", (.105, .08, .055), .34), floor_node["semanticRole"], .025)
     _tag(floor, floor_node["id"], floor_node["semanticRole"])
     _passive_from(floor_node, floor)
+    environment_look = None
+    if floor_node["parameters"]["materialPreset"] == "AGED_MAPLE_COURT_WITH_SCALE_CUES":
+        environment_look = physical_look.build_aged_court(scene, floor, fp, floor_node["initialCondition"]["location"])
     lp = light_node["parameters"]
     data = bpy.data.lights.new("ACTION_STATIC_KEY", "AREA")
     data.energy, data.color, data.size = lp["powerWatts"], lp["colorLinearRgb"], lp["sizeMeters"]
@@ -647,7 +680,21 @@ def _build_bottle_graph(scene, document):
         raise PhysicsActionError("PHYSICS_WORLD", "rigid body world missing")
     world.substeps_per_frame, world.solver_iterations = max(world.substeps_per_frame, 20), max(world.solver_iterations, 60)
     world.point_cache.frame_start, world.point_cache.frame_end = scene.frame_start, scene.frame_end
-    return {"actor": actor, "actorDetails": actor_details, "targets": targets, "targetDetails": target_details, "floor": floor, "lights": [lamp, fill], "primaryLight": lamp, "derivedPhysicalArchetypes": derived, "actorRadius": actor_node["parameters"]["radiusMeters"], "targetRadius": bottles_node["parameters"]["bodyRadiusMeters"], "releaseFrame": actor_node["initialCondition"]["releaseFrame"]}
+    return {
+        "actor": actor,
+        "actorDetails": actor_details,
+        "targets": targets,
+        "targetDetails": target_details,
+        "floor": floor,
+        "lights": [lamp, fill],
+        "primaryLight": lamp,
+        "derivedPhysicalArchetypes": derived,
+        "actorRadius": actor_node["parameters"]["radiusMeters"],
+        "targetRadius": bottles_node["parameters"]["bodyRadiusMeters"],
+        "releaseFrame": actor_node["initialCondition"]["releaseFrame"],
+        "physicalLook": {"basketball": ball_look, "bottles": None if bottle_look is None else {key: value for key, value in bottle_look.items() if key != "addedObjects"}, "environment": None if environment_look is None else {key: value for key, value in environment_look.items() if key != "objects"}},
+        "environmentObjects": [] if environment_look is None else environment_look["objects"],
+    }
 
 
 def _tilt(obj):
@@ -672,7 +719,7 @@ def _simulate_bottles(scene, created, document):
     initial_actor = actor.matrix_world.translation.copy()
     initial = {obj.name: obj.matrix_world.translation.copy() for obj in targets}
     initial_tilts = {obj.name: _tilt(obj) for obj in targets}
-    previous_actor = previous_tilts = None
+    previous_actor = previous_tilts = previous_targets = None
     responses = {obj.name: None for obj in targets}
     rows = []
     for frame in range(start, end + 1):
@@ -683,12 +730,14 @@ def _simulate_bottles(scene, created, document):
         gaps = {obj.name: max(0.0, (actor_position - obj.matrix_world.translation).length - created["actorRadius"] - created["targetRadius"]) for obj in targets}
         tilts = {obj.name: _tilt(obj) for obj in targets}
         angular = {name: 0 if previous_tilts is None else abs(tilts[name] - previous_tilts[name]) for name in tilts}
+        target_positions = {obj.name: obj.matrix_world.translation.copy() for obj in targets}
+        target_steps = {name: 0 if previous_targets is None else (target_positions[name] - previous_targets[name]).length for name in target_positions}
         displacements = {obj.name: (Vector((obj.matrix_world.translation.x, obj.matrix_world.translation.y)) - Vector((initial[obj.name].x, initial[obj.name].y))).length for obj in targets}
         for obj in targets:
             if responses[obj.name] is None and (tilts[obj.name] - initial_tilts[obj.name] >= 1 or displacements[obj.name] >= .012):
                 responses[obj.name] = frame
-        rows.append({"frame": frame, "actorLocation": list(actor_position), "actorStepMeters": actor_step, "minimumContactGapMeters": min(gaps.values()), "targetGapMeters": gaps, "targetTiltDegrees": tilts, "targetAngularStepDegrees": angular, "activeTargetCount": sum(value >= .25 for value in angular.values()), "aggregateAngularStepDegrees": sum(angular.values())})
-        previous_actor, previous_tilts = actor_position, tilts
+        rows.append({"frame": frame, "actorLocation": list(actor_position), "actorStepMeters": actor_step, "minimumContactGapMeters": min(gaps.values()), "targetGapMeters": gaps, "targetTiltDegrees": tilts, "targetAngularStepDegrees": angular, "maximumTargetTranslationStepMeters": max(target_steps.values()), "activeTargetCount": sum(value >= .25 for value in angular.values()), "aggregateAngularStepDegrees": sum(angular.values())})
+        previous_actor, previous_tilts, previous_targets = actor_position, tilts, target_positions
     tolerance = _relation(document, "COLLIDES_WITH")["contactToleranceMeters"]
     contact = next((row["frame"] for row in rows if row["frame"] >= created["releaseFrame"] and row["minimumContactGapMeters"] <= tolerance), None)
     response_values = [value for value in responses.values() if value is not None]
@@ -701,7 +750,7 @@ def _simulate_bottles(scene, created, document):
     final = rows[-1]["targetTiltDegrees"]
     contact_rows = {row["frame"]: row for row in rows}
     continuous = all(contact_rows.get(frame, {}).get("actorStepMeters", 0) > .001 for frame in (contact - 1, contact, contact + 1) if frame in contact_rows)
-    return {
+    result = {
         "source": "BLENDER_BULLET_EVALUATED_WORLD_TRANSFORMS",
         "contactFrame": contact,
         "firstResponseFrame": first_response,
@@ -714,8 +763,28 @@ def _simulate_bottles(scene, created, document):
         "finalTiltDegrees": {name: round(value, 8) for name, value in final.items()},
         "actorTravelMeters": round(max((Vector(row["actorLocation"]) - initial_actor).length for row in rows), 8),
         "continuousActorMotionThroughContact": continuous,
-        "samples": [{"frame": row["frame"], "actorLocation": [round(value, 8) for value in row["actorLocation"]], "actorStepMeters": round(row["actorStepMeters"], 8), "minimumContactGapMeters": round(row["minimumContactGapMeters"], 8), "targetTiltDegrees": {name: round(value, 8) for name, value in row["targetTiltDegrees"].items()}, "targetAngularStepDegrees": {name: round(value, 8) for name, value in row["targetAngularStepDegrees"].items()}} for row in rows],
+        "samples": [{"frame": row["frame"], "actorLocation": [round(value, 8) for value in row["actorLocation"]], "actorStepMeters": round(row["actorStepMeters"], 8), "minimumContactGapMeters": round(row["minimumContactGapMeters"], 8), "targetTiltDegrees": {name: round(value, 8) for name, value in row["targetTiltDegrees"].items()}, "targetAngularStepDegrees": {name: round(value, 8) for name, value in row["targetAngularStepDegrees"].items()}, "maximumTargetTranslationStepMeters": round(row["maximumTargetTranslationStepMeters"], 8)} for row in rows],
     }
+    if any(beat["deriveFrom"] == "SETTLED_GROUP_RESPONSE" for beat in document["beats"]):
+        window_count = 10
+        settled_window = None
+        for index, row in enumerate(rows):
+            if row["frame"] < peak["frame"]:
+                continue
+            window = rows[index:index + window_count]
+            if len(window) < window_count:
+                break
+            if all(item["aggregateAngularStepDegrees"] <= .25 and item["maximumTargetTranslationStepMeters"] <= .0015 for item in window):
+                settled_window = window
+                break
+        if settled_window is None:
+            raise PhysicsActionError("PHYSICS_SETTLE", "no derived ten-frame group settle window")
+        result["settledWindowStartFrame"] = settled_window[0]["frame"]
+        result["settledGroupFrame"] = settled_window[-1]["frame"]
+        result["settledWindowFrameCount"] = len(settled_window)
+        result["settledMaximumAggregateAngularStepDegrees"] = round(max(row["aggregateAngularStepDegrees"] for row in settled_window), 8)
+        result["settledMaximumTargetTranslationStepMeters"] = round(max(row["maximumTargetTranslationStepMeters"] for row in settled_window), 8)
+    return result
 
 
 def _semantic_center(objects):
@@ -733,20 +802,31 @@ def _configure_cameras(scene, created, physics, document, topology):
     offset = next(beat["offsetFrames"] for beat in document["beats"] if beat["id"] == "cause")
     contact = physics["contactFrame"]
     cause_frame = max(start, contact + offset)
-    contact_frame = min(end, max(contact, physics.get("firstResponseFrame", physics.get("firstShutterResponseFrame", contact)) + 2))
-    effect_frame = min(end, physics.get("peakGroupResponseFrame", physics.get("peakOpenFrame", contact_frame + 12)))
+    contact_frame = min(end, contact)
+    effect_beat = next(beat for beat in document["beats"] if beat["id"] == "effect")
+    if effect_beat["deriveFrom"] == "SETTLED_GROUP_RESPONSE":
+        effect_frame = min(end, physics["settledGroupFrame"])
+    else:
+        effect_frame = min(end, physics.get("peakGroupResponseFrame", physics.get("peakOpenFrame", contact_frame + 12)))
     actor, targets = created["actor"], created["targets"]
-    cause_objects = [actor, created.get("ramp", created.get("floor")), *targets]
+    physical_environment = created.get("physicalLook", {}).get("environment")
+    close_physical_staging = bool(physical_environment and physical_environment.get("preset") == "AGED_MAPLE_COURT_WITH_SCALE_CUES")
+    cause_objects = [actor, *targets] if close_physical_staging else [actor, created.get("ramp", created.get("floor")), *targets]
     contact_objects = [actor, *targets]
-    effect_objects = [*targets, actor]
+    effect_objects = [*targets] if effect_beat["deriveFrom"] == "SETTLED_GROUP_RESPONSE" else [*targets, actor]
     if topology == "HINGE_LIGHT":
         effect_objects.insert(0, created["receiver"])
     directions = ((1, .78, -.48), (.9, 1, -.25), (1, .12, -.55))
+    if close_physical_staging:
+        directions = (directions[0], directions[1], (1, .24, -.28))
+    occupancies = (.58, .7, .64) if close_physical_staging else (.66, .68, .66)
     records, cameras = {}, {}
-    for role, frame, objects, vector, occupancy in (
-        ("cause", cause_frame, cause_objects, directions[0], .66),
-        ("contact", contact_frame, contact_objects, directions[1], .68),
-        ("effect", effect_frame, effect_objects, directions[2], .66),
+    for role, frame, objects, vector, occupancy in zip(
+        ("cause", "contact", "effect"),
+        (cause_frame, contact_frame, effect_frame),
+        (cause_objects, contact_objects, effect_objects),
+        directions,
+        occupancies,
     ):
         scene.frame_set(frame)
         bpy.context.view_layer.update()
@@ -841,7 +921,9 @@ def execute_physics_action(repository_root, spec_uri, inspection_token, scene=No
             "targets": [obj.name for obj in created["targets"]],
             "lights": [obj.name for obj in created["lights"]],
         },
+        "physicalLook": created.get("physicalLook"),
         "review": {
+            "resolution": document["cinematography"]["reviewResolution"],
             "stillFrames": [cinematography[key]["frame"] for key in ("cause", "contact", "effect")],
             "contactClipFrameRangeInclusive": [max(scene.frame_start, physics["contactFrame"] - 12), min(scene.frame_end, physics["contactFrame"] + 35)],
         },
