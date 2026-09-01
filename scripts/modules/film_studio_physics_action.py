@@ -32,8 +32,14 @@ import film_studio_physical_performance as direction
 
 
 SPEC_VERSION = "bfs.physicsActionSpec.v0.1"
+BREAKABLE_SPEC_VERSION = "bfs.physicsActionSpec.v0.2"
+DERIVED_TARGET_SPEC_VERSION = "bfs.physicsActionSpec.v0.4"
 CONTRACT_VERSION = "bfs.filmStudioPhysicsAction.v0.1"
+BREAKABLE_CONTRACT_VERSION = "bfs.filmStudioPhysicsAction.v0.2"
+DERIVED_TARGET_CONTRACT_VERSION = "bfs.filmStudioPhysicsAction.v0.3"
 RESULT_VERSION = "bfs.physicsActionResult.v0.1"
+BREAKABLE_RESULT_VERSION = "bfs.physicsActionResult.v0.2"
+DERIVED_TARGET_RESULT_VERSION = "bfs.physicsActionResult.v0.3"
 GENERATED_TAG = "bfs.physicsAction.v0.1"
 
 FACTORIES = {
@@ -43,6 +49,7 @@ FACTORIES = {
     "HINGED_OCCLUDER_IN_ARCHITECTURAL_APERTURE",
     "MATTE_RELIEF_SIGNAL_WALL",
     "FILLED_LATHED_BOTTLE_ARRAY",
+    "BREAKAWAY_BOTTLE_CAP",
     "BEVELED_GROUND_PLANE",
     "STATIC_AREA_LIGHT",
 }
@@ -53,10 +60,12 @@ RELATIONS = {
     "HINGED_TO_WORLD",
     "OCCLUDES_LIGHT_TO",
     "PROPAGATES_RESPONSE_WITHIN",
+    "BREAKABLE_FIXED_TO",
 }
 PROHIBITED_OUTCOME_KEYS = {
     "finalPosition", "finalRotation", "finalPose", "targetPose", "targetFrame",
-    "contactFrame", "responseFrame", "peakFrame",
+    "contactFrame", "responseFrame", "peakFrame", "breakFrame",
+    "detachmentFrame", "detachedPose", "detachmentVelocity",
 }
 
 
@@ -142,6 +151,11 @@ def _outcome_scan(value, path="/"):
 
 
 def _validate_initial(value, factory, timeline):
+    if factory == "BREAKAWAY_BOTTLE_CAP":
+        _exact(value, {"deriveFromTargetGeometry"}, "/nodes/initialCondition")
+        if value["deriveFromTargetGeometry"] is not True:
+            raise PhysicsActionError("SPEC_SCHEMA", "deriveFromTargetGeometry")
+        return
     base = {"location", "rotationDegrees"}
     if factory in {"GROOVED_CERAMIC_SPHERE", "HINGED_OCCLUDER_IN_ARCHITECTURAL_APERTURE", "FILLED_LATHED_BOTTLE_ARRAY"}:
         keys = base | {"releaseFrame"}
@@ -188,6 +202,7 @@ def _validate_rigid(value, factory):
         "GROOVED_CERAMIC_SPHERE": "SPHERE", "GROOVED_BASKETBALL": "SPHERE",
         "METRIC_WEDGE_WITH_SIDE_RAILS": "MESH", "HINGED_OCCLUDER_IN_ARCHITECTURAL_APERTURE": "BOX",
         "MATTE_RELIEF_SIGNAL_WALL": "BOX", "FILLED_LATHED_BOTTLE_ARRAY": "CONVEX_HULL",
+        "BREAKAWAY_BOTTLE_CAP": "CYLINDER",
         "BEVELED_GROUND_PLANE": "BOX",
     }
     if value["collisionShape"] != allowed_shapes[factory]:
@@ -202,6 +217,7 @@ def _validate_parameters(value, factory):
         "HINGED_OCCLUDER_IN_ARCHITECTURAL_APERTURE": {"apertureWidthMeters", "apertureHeightMeters", "shutterThicknessMeters", "materialPreset"},
         "MATTE_RELIEF_SIGNAL_WALL": {"widthMeters", "heightMeters", "materialPreset"},
         "FILLED_LATHED_BOTTLE_ARRAY": {"count", "heightMeters", "bodyRadiusMeters", "fillFractions", "materialPreset", "initialBasePositions"},
+        "BREAKAWAY_BOTTLE_CAP": set(value) if isinstance(value, dict) else set(),
         "BEVELED_GROUND_PLANE": {"widthMeters", "depthMeters", "thicknessMeters", "materialPreset"},
         "STATIC_AREA_LIGHT": {"powerWatts", "colorLinearRgb", "sizeMeters"},
     }[factory]
@@ -228,6 +244,16 @@ def _validate_parameters(value, factory):
             _number(fill, .05, .98, "fillFraction")
         for position in value["initialBasePositions"]:
             _vector(position, 3, -10, 10, "initialBasePosition")
+    elif factory == "BREAKAWAY_BOTTLE_CAP":
+        allowed = ({"targetMemberIndex", "materialPreset"}, {"targetMemberPolicy", "materialPreset"})
+        if set(value) not in allowed:
+            raise PhysicsActionError("SPEC_SCHEMA", "breakaway cap target binding")
+        if "targetMemberIndex" in value:
+            _integer(value["targetMemberIndex"], 0, 7, "targetMemberIndex")
+        elif value["targetMemberPolicy"] != "MINIMUM_DISTANCE_TO_INITIATOR_RELEASE_RAY":
+            raise PhysicsActionError("SPEC_SCHEMA", "targetMemberPolicy")
+        if value["materialPreset"] != "CRIMPED_ALUMINUM_CAP":
+            raise PhysicsActionError("SPEC_SCHEMA", "breakaway cap material")
     elif factory == "BEVELED_GROUND_PLANE":
         for key in ("widthMeters", "depthMeters", "thicknessMeters"):
             _number(value[key], .02, 20, key)
@@ -250,6 +276,7 @@ def _validate_relation(value, ids):
         "HINGED_TO_WORLD": {"id", "type", "source", "axis", "limitsDegrees", "solverIterations", "passiveStopOffsetFromUpperLimitDegrees"},
         "OCCLUDES_LIGHT_TO": {"id", "type", "source", "target", "via"},
         "PROPAGATES_RESPONSE_WITHIN": {"id", "type", "source", "minimumResponders"},
+        "BREAKABLE_FIXED_TO": {"id", "type", "source", "target", "breakingImpulseThreshold", "solverIterations", "disableCollisions"},
     }[kind]
     _exact(value, keys, "/relations")
     refs = [value[key] for key in ("source", "target", "via") if key in value]
@@ -267,11 +294,20 @@ def _validate_relation(value, ids):
         _number(value["passiveStopOffsetFromUpperLimitDegrees"], 1, 20, "stop offset")
     elif kind == "PROPAGATES_RESPONSE_WITHIN":
         _integer(value["minimumResponders"], 1, 8, "minimumResponders")
+    elif kind == "BREAKABLE_FIXED_TO":
+        _number(value["breakingImpulseThreshold"], 0.0001, 1000.0, "breakingImpulseThreshold")
+        _integer(value["solverIterations"], 20, 200, "solverIterations")
+        if value["disableCollisions"] is not True:
+            raise PhysicsActionError("SPEC_SCHEMA", "breakable attached-body collisions")
 
 
 def _validate(document):
-    _exact(document, {"$schema", "schemaVersion", "projectId", "timeline", "world", "nodes", "relations", "beats", "cinematography", "forbidden", "physicsActionSpecHash"}, "/")
-    if document["$schema"] != SPEC_VERSION or document["schemaVersion"] != SPEC_VERSION:
+    version = document.get("schemaVersion")
+    top_keys = {"$schema", "schemaVersion", "projectId", "timeline", "world", "nodes", "relations", "beats", "cinematography", "forbidden", "physicsActionSpecHash"}
+    if version == DERIVED_TARGET_SPEC_VERSION:
+        top_keys.add("physicalVariationBasisSpecHash")
+    _exact(document, top_keys, "/")
+    if document["$schema"] != version or version not in {SPEC_VERSION, BREAKABLE_SPEC_VERSION, DERIVED_TARGET_SPEC_VERSION}:
         raise PhysicsActionError("UNSUPPORTED_SCHEMA", str(document.get("schemaVersion")))
     if not isinstance(document["projectId"], str) or not document["projectId"]:
         raise PhysicsActionError("SPEC_SCHEMA", "projectId")
@@ -288,6 +324,10 @@ def _validate(document):
     _exact(world, {"gravityMetersPerSecondSquared", "unitScaleMeters"}, "/world")
     if world != {"gravityMetersPerSecondSquared": [0.0, 0.0, -9.81], "unitScaleMeters": 1.0}:
         raise PhysicsActionError("NONMETRIC_SCENE", "world")
+    if version == DERIVED_TARGET_SPEC_VERSION:
+        basis = document["physicalVariationBasisSpecHash"]
+        if not isinstance(basis, str) or len(basis) != 64 or any(character not in "0123456789abcdef" for character in basis):
+            raise PhysicsActionError("SPEC_SCHEMA", "physicalVariationBasisSpecHash")
     if not isinstance(document["nodes"], list) or not 3 <= len(document["nodes"]) <= 16:
         raise PhysicsActionError("SPEC_SCHEMA", "nodes")
     ids = set()
@@ -307,6 +347,13 @@ def _validate(document):
         _validate_parameters(node["parameters"], factory)
         _validate_initial(node["initialCondition"], factory, timeline)
         _validate_rigid(node.get("rigidBody"), factory)
+    if version == SPEC_VERSION and any(node["factory"] == "BREAKAWAY_BOTTLE_CAP" for node in document["nodes"]):
+        raise PhysicsActionError("UNSUPPORTED_FACTORY", "BREAKAWAY_BOTTLE_CAP requires v0.2")
+    cap_nodes = [node for node in document["nodes"] if node["factory"] == "BREAKAWAY_BOTTLE_CAP"]
+    if version == BREAKABLE_SPEC_VERSION and cap_nodes and "targetMemberIndex" not in cap_nodes[0]["parameters"]:
+        raise PhysicsActionError("SPEC_SCHEMA", "v0.2 requires targetMemberIndex")
+    if version == DERIVED_TARGET_SPEC_VERSION and cap_nodes and "targetMemberPolicy" not in cap_nodes[0]["parameters"]:
+        raise PhysicsActionError("SPEC_SCHEMA", "v0.4 requires targetMemberPolicy")
     if not isinstance(document["relations"], list) or not document["relations"]:
         raise PhysicsActionError("SPEC_SCHEMA", "relations")
     relation_ids = set()
@@ -315,6 +362,21 @@ def _validate(document):
         if relation["id"] in relation_ids:
             raise PhysicsActionError("SPEC_SCHEMA", "duplicate relation")
         relation_ids.add(relation["id"])
+    breakable_relations = [relation for relation in document["relations"] if relation["type"] == "BREAKABLE_FIXED_TO"]
+    if version == SPEC_VERSION and breakable_relations:
+        raise PhysicsActionError("UNSUPPORTED_RELATION", "BREAKABLE_FIXED_TO requires v0.2")
+    if version in {BREAKABLE_SPEC_VERSION, DERIVED_TARGET_SPEC_VERSION}:
+        caps = cap_nodes
+        if len(caps) != 1 or len(breakable_relations) != 1:
+            raise PhysicsActionError("SPEC_SCHEMA", "v0.2 requires one breakaway cap and one breakable relation")
+        relation = breakable_relations[0]
+        if relation["source"] != caps[0]["id"]:
+            raise PhysicsActionError("SPEC_SCHEMA", "breakable relation source")
+        target = next((node for node in document["nodes"] if node["id"] == relation["target"]), None)
+        if target is None or target["factory"] != "FILLED_LATHED_BOTTLE_ARRAY":
+            raise PhysicsActionError("SPEC_SCHEMA", "breakable relation target")
+        if "targetMemberIndex" in caps[0]["parameters"] and caps[0]["parameters"]["targetMemberIndex"] >= target["parameters"]["count"]:
+            raise PhysicsActionError("SPEC_SCHEMA", "targetMemberIndex")
     if sum(relation["type"] == "COLLIDES_WITH" for relation in document["relations"]) != 1:
         raise PhysicsActionError("SPEC_SCHEMA", "one primary collision required")
     beat_ids = set()
@@ -353,6 +415,8 @@ def _validate(document):
         raise PhysicsActionError("SPEC_SCHEMA", "motion blur")
     _number(blur["targetBlurPixels"], 1, 12, "targetBlurPixels")
     forbidden_keys = {"authoredTransformAfterRelease", "authoredContactFrame", "authoredResponseFrame", "authoredFinalPose", "animatedLightPowerOrColor", "postprocessMotionBlur", "projectOrFixtureBranchInProductCode", "arbitraryPythonShellNetworkOrFilesystemAuthority"}
+    if version in {BREAKABLE_SPEC_VERSION, DERIVED_TARGET_SPEC_VERSION}:
+        forbidden_keys |= {"authoredBreakFrame", "authoredDetachedPose", "authoredDetachmentVelocity"}
     _exact(document["forbidden"], forbidden_keys, "/forbidden")
     if any(document["forbidden"][key] is not True for key in forbidden_keys):
         raise PhysicsActionError("AUTHORITY_EXPANSION", "forbidden controls")
@@ -370,7 +434,7 @@ def _validate(document):
 
 def matches_physics_action(repository_root, spec_uri):
     root = Path(repository_root).resolve(strict=True)
-    return _read_json(_below_existing(root, spec_uri)).get("schemaVersion") == SPEC_VERSION
+    return _read_json(_below_existing(root, spec_uri)).get("schemaVersion") in {SPEC_VERSION, BREAKABLE_SPEC_VERSION, DERIVED_TARGET_SPEC_VERSION}
 
 
 def _inspection(repository_root, spec_uri):
@@ -380,16 +444,25 @@ def _inspection(repository_root, spec_uri):
     file_hash = _sha256(path.read_bytes())
     graph = {"nodes": [{"id": node["id"], "role": node["semanticRole"], "factory": node["factory"]} for node in document["nodes"]], "relations": document["relations"], "beats": document["beats"]}
     graph_hash = _sha256(_canonical(graph).encode("utf-8"))
-    token = _sha256(_canonical({"contractVersion": CONTRACT_VERSION, "fileSha256": file_hash, "specHash": document["physicsActionSpecHash"], "compiledGraphHash": graph_hash}).encode("utf-8"))
+    contract_version = {
+        SPEC_VERSION: CONTRACT_VERSION,
+        BREAKABLE_SPEC_VERSION: BREAKABLE_CONTRACT_VERSION,
+        DERIVED_TARGET_SPEC_VERSION: DERIVED_TARGET_CONTRACT_VERSION,
+    }[document["schemaVersion"]]
+    token = _sha256(_canonical({"contractVersion": contract_version, "fileSha256": file_hash, "specHash": document["physicsActionSpecHash"], "compiledGraphHash": graph_hash}).encode("utf-8"))
     return document, file_hash, graph, graph_hash, token
 
 
 def inspect_physics_action(repository_root, spec_uri):
     document, file_hash, graph, graph_hash, token = _inspection(repository_root, spec_uri)
+    contract_version = {
+        SPEC_VERSION: CONTRACT_VERSION, BREAKABLE_SPEC_VERSION: BREAKABLE_CONTRACT_VERSION,
+        DERIVED_TARGET_SPEC_VERSION: DERIVED_TARGET_CONTRACT_VERSION,
+    }[document["schemaVersion"]]
     active = [node for node in document["nodes"] if node.get("rigidBody", {}).get("type") == "ACTIVE"]
     collision = next(relation for relation in document["relations"] if relation["type"] == "COLLIDES_WITH")
     nodes = {node["id"]: node for node in document["nodes"]}
-    return {
+    result = {
         "status": "APPROVED_READY",
         "sceneId": document["projectId"],
         "actorFactory": nodes[collision["source"]]["factory"],
@@ -404,6 +477,10 @@ def inspect_physics_action(repository_root, spec_uri):
         "compiledGraph": graph,
         "inspectionToken": token,
     }
+    if document["schemaVersion"] in {BREAKABLE_SPEC_VERSION, DERIVED_TARGET_SPEC_VERSION}:
+        result["contractVersion"] = contract_version
+        result["breakableAttachmentCount"] = 1
+    return result
 
 
 def _node_map(document):
@@ -590,9 +667,9 @@ def _bottle_document(document, actor_node, bottles_node):
     bases = [[group[i] + position[i] for i in range(3)] for position in bp["initialBasePositions"]]
     profile = [[body_radius * ratio, height * z] for ratio, z in ((.88, 0), (1, .03), (1, .63), (.97, .73), (.74, .81), (.43, .88), (.4, .97), (.43, 1))]
     rigid = bottles_node["rigidBody"]
-    realism = bp["materialPreset"] == "HOUSEHOLD_GLASS_WITH_VISIBLE_FILL_AND_VARIATION"
+    realism = bp["materialPreset"] in {"HOUSEHOLD_GLASS_WITH_VISIBLE_FILL_AND_VARIATION", "MOLDED_HOUSEHOLD_GLASS_WITH_CONTACT_OVALITY"}
     variation = {
-        "basisSceneSpecHash": document["physicsActionSpecHash"],
+        "basisSceneSpecHash": document.get("physicalVariationBasisSpecHash", document["physicsActionSpecHash"]),
         "seed": 84017 if realism else 31337,
         "positionJitterMetersMaximum": .006 if realism else 0,
         "yawJitterDegreesMaximum": 4 if realism else 0,
@@ -629,13 +706,75 @@ def _bottle_document(document, actor_node, bottles_node):
     }
 
 
+def _derive_release_ray_target_binding(document, synthetic):
+    actor_node = next(node for node in document["nodes"] if node["factory"] == "GROOVED_BASKETBALL")
+    start = Vector((*actor_node["initialCondition"]["location"][:2], 0.0))
+    velocity = Vector((*actor_node["initialCondition"]["preReleaseVelocityMetersPerSecond"][:2], 0.0))
+    if velocity.length <= 1e-8:
+        raise PhysicsActionError("ATTACHMENT_TARGET", "initiator release ray has zero speed")
+    direction_vector = velocity.normalized()
+    target_group = synthetic["targetGroup"]
+    variation = target_group["deterministicVariation"]
+
+    def sample(member_number, channel):
+        token = f"{variation['basisSceneSpecHash']}:{variation['seed']}:{member_number}:{channel}".encode("utf-8")
+        integer = int.from_bytes(hashlib.sha256(token).digest()[:8], "big")
+        return integer / (2 ** 64 - 1) * 2.0 - 1.0
+
+    rows = []
+    for index, base in enumerate(target_group["initialBasePositions"]):
+        member_number = index + 1
+        center = Vector((
+            base[0] + sample(member_number, "position-x") * variation["positionJitterMetersMaximum"],
+            base[1] + sample(member_number, "position-y") * variation["positionJitterMetersMaximum"],
+            0.0,
+        ))
+        offset = center - start
+        forward = offset.dot(direction_vector)
+        perpendicular = abs(offset.x * direction_vector.y - offset.y * direction_vector.x)
+        rows.append({"memberIndex": index, "centerMeters": [round(center.x, 8), round(center.y, 8)], "forwardProjectionMeters": round(forward, 8), "perpendicularDistanceMeters": round(perpendicular, 8)})
+    eligible = sorted((row for row in rows if row["forwardProjectionMeters"] > 0), key=lambda row: (row["perpendicularDistanceMeters"], row["forwardProjectionMeters"], row["memberIndex"]))
+    if len(eligible) < 2 or eligible[1]["perpendicularDistanceMeters"] - eligible[0]["perpendicularDistanceMeters"] < .002:
+        raise PhysicsActionError("ATTACHMENT_TARGET", "release ray does not identify one unique target member")
+    return {
+        "policy": "MINIMUM_DISTANCE_TO_INITIATOR_RELEASE_RAY",
+        "source": "METRIC_INITIAL_CONDITIONS_BEFORE_SCENE_MUTATION",
+        "physicalVariationBasisSpecHash": variation["basisSceneSpecHash"],
+        "selectedMemberIndex": eligible[0]["memberIndex"],
+        "uniquenessMarginMeters": round(eligible[1]["perpendicularDistanceMeters"] - eligible[0]["perpendicularDistanceMeters"], 8),
+        "candidates": rows,
+    }
+
+
+def _apply_molded_glass_contact_ovality(targets):
+    amplitude, lobes = .00045, 2
+    phases = []
+    for index, target in enumerate(targets, 1):
+        phase = math.radians((index * 57) % 180)
+        phases.append([index, round(math.degrees(phase), 8)])
+        for vertex in target.data.vertices:
+            radius = math.hypot(vertex.co.x, vertex.co.y)
+            if radius > 1e-8:
+                offset = min(amplitude, radius * .01) * math.cos(lobes * (math.atan2(vertex.co.y, vertex.co.x) - phase))
+                scale = (radius + offset) / radius
+                vertex.co.x, vertex.co.y = vertex.co.x * scale, vertex.co.y * scale
+        target.data.update()
+        target["film_studio_contact_ovality_amplitude_m"] = amplitude
+        target["film_studio_contact_ovality_lobes"] = lobes
+    return {"source": "MATERIAL_PRESET_FACTORY_DEFAULT", "preset": "MOLDED_HOUSEHOLD_GLASS_WITH_CONTACT_OVALITY", "radialAmplitudeMeters": amplitude, "harmonicLobes": lobes, "memberPhaseDegrees": phases, "visibleMeshIsCollisionHullSource": True, "solverSleep": False}
+
+
 def _build_bottle_graph(scene, document):
     actor_node = next(node for node in document["nodes"] if node["factory"] == "GROOVED_BASKETBALL")
     bottles_node = next(node for node in document["nodes"] if node["factory"] == "FILLED_LATHED_BOTTLE_ARRAY")
     floor_node = next(node for node in document["nodes"] if node["factory"] == "BEVELED_GROUND_PLANE")
     light_node = next(node for node in document["nodes"] if node["factory"] == "STATIC_AREA_LIGHT")
+    cap_nodes = [node for node in document["nodes"] if node["factory"] == "BREAKAWAY_BOTTLE_CAP"]
     dark = causal._material("MAT_Action_BottleDark", (.008, .009, .012), .38)
     synthetic = _bottle_document(document, actor_node, bottles_node)
+    attachment_derivation = None
+    if cap_nodes and "targetMemberPolicy" in cap_nodes[0]["parameters"]:
+        attachment_derivation = _derive_release_ray_target_binding(document, synthetic)
     actor, actor_details = causal._create_actor(synthetic, dark)
     _tag(actor, actor_node["id"], actor_node["semanticRole"])
     ball_look = None
@@ -644,8 +783,11 @@ def _build_bottle_graph(scene, document):
     targets, target_details, derived = causal._create_metric_bottle_targets(synthetic, dark)
     for target in targets:
         _tag(target, bottles_node["id"], bottles_node["semanticRole"])
+    contact_geometry = None
+    if bottles_node["parameters"]["materialPreset"] == "MOLDED_HOUSEHOLD_GLASS_WITH_CONTACT_OVALITY":
+        contact_geometry = _apply_molded_glass_contact_ovality(targets)
     bottle_look = None
-    if bottles_node["parameters"]["materialPreset"] == "HOUSEHOLD_GLASS_WITH_VISIBLE_FILL_AND_VARIATION":
+    if bottles_node["parameters"]["materialPreset"] in {"HOUSEHOLD_GLASS_WITH_VISIBLE_FILL_AND_VARIATION", "MOLDED_HOUSEHOLD_GLASS_WITH_CONTACT_OVALITY"}:
         bottle_look = physical_look.enhance_glass_bottles(
             targets,
             target_details,
@@ -655,6 +797,39 @@ def _build_bottle_graph(scene, document):
             synthetic["targetGroup"]["modeling"]["wallThicknessMeters"],
         )
         target_details.extend(bottle_look["addedObjects"])
+    secondary, breakable_constraint, attachment_target = [], None, None
+    if cap_nodes:
+        cap_node = cap_nodes[0]
+        attachment_relation = _relation(document, "BREAKABLE_FIXED_TO")
+        target_index = cap_node["parameters"].get("targetMemberIndex")
+        if target_index is None:
+            target_index = attachment_derivation["selectedMemberIndex"]
+        attachment_target = targets[target_index]
+        cap = bpy.data.objects.get(f"CAUSAL_DETAIL_BottleCap_{target_index + 1:02d}")
+        if cap is None:
+            raise PhysicsActionError("FACTORY_BUILD", "derived bottle cap detail is missing")
+        cap_world = cap.matrix_world.copy()
+        cap.parent = None
+        cap.matrix_world = cap_world
+        _tag(cap, cap_node["id"], cap_node["semanticRole"])
+        cap["film_studio_pose_source"] = "BLENDER_BULLET_BREAKABLE_FIXED_ATTACHMENT"
+        cap["film_studio_attachment_target"] = attachment_target.name
+        _active_from(cap_node, cap)
+        bpy.ops.object.empty_add(type="PLAIN_AXES", location=cap.matrix_world.translation)
+        constraint_object = _tag(bpy.context.object, attachment_relation["id"], "breakable_fixed_constraint")
+        constraint_object.name = "ACTION_BREAKABLE_CAP_CONSTRAINT"
+        direction._select(constraint_object)
+        bpy.ops.rigidbody.constraint_add()
+        breakable_constraint = constraint_object.rigid_body_constraint
+        breakable_constraint.type = "FIXED"
+        breakable_constraint.object1 = attachment_target
+        breakable_constraint.object2 = cap
+        breakable_constraint.disable_collisions = attachment_relation["disableCollisions"]
+        breakable_constraint.use_breaking = True
+        breakable_constraint.breaking_threshold = attachment_relation["breakingImpulseThreshold"]
+        breakable_constraint.use_override_solver_iterations = True
+        breakable_constraint.solver_iterations = attachment_relation["solverIterations"]
+        secondary.append(cap)
     fp = floor_node["parameters"]
     floor = light_build._box("ACTION_GROUND", floor_node["initialCondition"]["location"], (fp["widthMeters"] / 2, fp["depthMeters"] / 2, fp["thicknessMeters"] / 2), causal._material("MAT_Action_Ground", (.105, .08, .055), .34), floor_node["semanticRole"], .025)
     _tag(floor, floor_node["id"], floor_node["semanticRole"])
@@ -678,12 +853,20 @@ def _build_bottle_graph(scene, document):
     world = scene.rigidbody_world
     if world is None:
         raise PhysicsActionError("PHYSICS_WORLD", "rigid body world missing")
-    world.substeps_per_frame, world.solver_iterations = max(world.substeps_per_frame, 20), max(world.solver_iterations, 60)
+    requested_iterations = 60
+    if breakable_constraint is not None:
+        requested_iterations = _relation(document, "BREAKABLE_FIXED_TO")["solverIterations"]
+    world.substeps_per_frame, world.solver_iterations = max(world.substeps_per_frame, 20), max(world.solver_iterations, requested_iterations)
     world.point_cache.frame_start, world.point_cache.frame_end = scene.frame_start, scene.frame_end
     return {
         "actor": actor,
         "actorDetails": actor_details,
         "targets": targets,
+        "secondary": secondary,
+        "breakableConstraint": breakable_constraint,
+        "attachmentTarget": attachment_target,
+        "attachmentTargetDerivation": attachment_derivation,
+        "contactGeometry": contact_geometry,
         "targetDetails": target_details,
         "floor": floor,
         "lights": [lamp, fill],
@@ -716,10 +899,20 @@ def _simulate_gate(scene, created, document):
 def _simulate_bottles(scene, created, document):
     start, end = document["timeline"]["frameStart"], document["timeline"]["frameEnd"]
     actor, targets = created["actor"], created["targets"]
+    secondary = created.get("secondary", [])
     initial_actor = actor.matrix_world.translation.copy()
     initial = {obj.name: obj.matrix_world.translation.copy() for obj in targets}
     initial_tilts = {obj.name: _tilt(obj) for obj in targets}
     previous_actor = previous_tilts = previous_targets = None
+    previous_secondary_position = previous_secondary_rotation = None
+    attachment_relative = secondary_initial_rotation = None
+    floor_top = None
+    if secondary:
+        cap = secondary[0]
+        attachment_target = created["attachmentTarget"]
+        attachment_relative = attachment_target.matrix_world.inverted() @ cap.matrix_world
+        secondary_initial_rotation = cap.matrix_world.to_quaternion().copy()
+        floor_top = max((created["floor"].matrix_world @ Vector(corner)).z for corner in created["floor"].bound_box)
     responses = {obj.name: None for obj in targets}
     rows = []
     for frame in range(start, end + 1):
@@ -736,7 +929,27 @@ def _simulate_bottles(scene, created, document):
         for obj in targets:
             if responses[obj.name] is None and (tilts[obj.name] - initial_tilts[obj.name] >= 1 or displacements[obj.name] >= .012):
                 responses[obj.name] = frame
-        rows.append({"frame": frame, "actorLocation": list(actor_position), "actorStepMeters": actor_step, "minimumContactGapMeters": min(gaps.values()), "targetGapMeters": gaps, "targetTiltDegrees": tilts, "targetAngularStepDegrees": angular, "maximumTargetTranslationStepMeters": max(target_steps.values()), "activeTargetCount": sum(value >= .25 for value in angular.values()), "aggregateAngularStepDegrees": sum(angular.values())})
+        row = {"frame": frame, "actorLocation": list(actor_position), "actorStepMeters": actor_step, "minimumContactGapMeters": min(gaps.values()), "targetGapMeters": gaps, "targetTiltDegrees": tilts, "targetAngularStepDegrees": angular, "maximumTargetTranslationStepMeters": max(target_steps.values()), "activeTargetCount": sum(value >= .25 for value in angular.values()), "aggregateAngularStepDegrees": sum(angular.values())}
+        if secondary:
+            cap = secondary[0]
+            cap_position = cap.matrix_world.translation.copy()
+            cap_rotation = cap.matrix_world.to_quaternion().copy()
+            expected_cap = attachment_target.matrix_world @ attachment_relative
+            separation = (cap_position - expected_cap.translation).length
+            cap_step = 0 if previous_secondary_position is None else (cap_position - previous_secondary_position).length
+            cap_angular_step = 0 if previous_secondary_rotation is None else math.degrees(previous_secondary_rotation.rotation_difference(cap_rotation).angle)
+            cap_angular_response = math.degrees(secondary_initial_rotation.rotation_difference(cap_rotation).angle)
+            cap_minimum_z = min((cap.matrix_world @ Vector(corner)).z for corner in cap.bound_box)
+            row.update({
+                "capLocation": list(cap_position),
+                "capAttachmentSeparationMeters": separation,
+                "capTranslationStepMeters": cap_step,
+                "capAngularStepDegrees": cap_angular_step,
+                "capAngularResponseDegrees": cap_angular_response,
+                "capFloorPenetrationMeters": max(0.0, floor_top - cap_minimum_z),
+            })
+            previous_secondary_position, previous_secondary_rotation = cap_position, cap_rotation
+        rows.append(row)
         previous_actor, previous_tilts, previous_targets = actor_position, tilts, target_positions
     tolerance = _relation(document, "COLLIDES_WITH")["contactToleranceMeters"]
     contact = next((row["frame"] for row in rows if row["frame"] >= created["releaseFrame"] and row["minimumContactGapMeters"] <= tolerance), None)
@@ -765,6 +978,39 @@ def _simulate_bottles(scene, created, document):
         "continuousActorMotionThroughContact": continuous,
         "samples": [{"frame": row["frame"], "actorLocation": [round(value, 8) for value in row["actorLocation"]], "actorStepMeters": round(row["actorStepMeters"], 8), "minimumContactGapMeters": round(row["minimumContactGapMeters"], 8), "targetTiltDegrees": {name: round(value, 8) for name, value in row["targetTiltDegrees"].items()}, "targetAngularStepDegrees": {name: round(value, 8) for name, value in row["targetAngularStepDegrees"].items()}, "maximumTargetTranslationStepMeters": round(row["maximumTargetTranslationStepMeters"], 8)} for row in rows],
     }
+    if secondary:
+        attachment_relation = _relation(document, "BREAKABLE_FIXED_TO")
+        precontact = [row for row in rows if row["frame"] <= contact - 1]
+        detached = next((row for row in rows if row["frame"] >= contact and row["capAttachmentSeparationMeters"] >= .035), None)
+        response = next((row for row in rows if row["frame"] >= contact and row["capAttachmentSeparationMeters"] >= .005), None)
+        continuous_rows = [] if detached is None else [row for row in rows if detached["frame"] <= row["frame"] <= detached["frame"] + 2]
+        result["breakableAttachment"] = {
+            "source": "BLENDER_BULLET_BREAKABLE_FIXED_CONSTRAINT",
+            "constraintType": "FIXED",
+            "breakingEnabled": True,
+            "breakingImpulseThreshold": attachment_relation["breakingImpulseThreshold"],
+            "solverIterations": attachment_relation["solverIterations"],
+            "attachedBodyCollisionsDisabled": attachment_relation["disableCollisions"],
+            "attachmentTarget": created["attachmentTarget"].name,
+            "attachmentTargetDerivation": created.get("attachmentTargetDerivation"),
+            "secondaryBody": secondary[0].name,
+            "maximumPrecontactAttachmentSeparationMeters": round(max(row["capAttachmentSeparationMeters"] for row in precontact), 8),
+            "responseFrame": None if response is None else response["frame"],
+            "detachmentFrame": None if detached is None else detached["frame"],
+            "detachmentDelayFrames": None if detached is None else detached["frame"] - contact,
+            "maximumAttachmentSeparationMeters": round(max(row["capAttachmentSeparationMeters"] for row in rows), 8),
+            "maximumAngularResponseDegrees": round(max(row["capAngularResponseDegrees"] for row in rows), 8),
+            "maximumFloorPenetrationMeters": round(max(row["capFloorPenetrationMeters"] for row in rows), 8),
+            "continuousMotionForThreeFramesFromDetachment": len(continuous_rows) == 3 and all(row["capTranslationStepMeters"] > .0001 for row in continuous_rows[1:]),
+            "eventFrameSource": "DERIVED_FROM_PRIMARY_CONTACT_AND_EVALUATED_ATTACHMENT_SEPARATION",
+            "authoredBreakFrame": False,
+            "authoredDetachedPose": False,
+            "authoredDetachmentVelocity": False,
+        }
+        result["samples"] = [
+            {**sample, "capLocation": [round(value, 8) for value in row["capLocation"]], "capAttachmentSeparationMeters": round(row["capAttachmentSeparationMeters"], 8), "capTranslationStepMeters": round(row["capTranslationStepMeters"], 8), "capAngularStepDegrees": round(row["capAngularStepDegrees"], 8), "capAngularResponseDegrees": round(row["capAngularResponseDegrees"], 8), "capFloorPenetrationMeters": round(row["capFloorPenetrationMeters"], 8)}
+            for sample, row in zip(result["samples"], rows)
+        ]
     if any(beat["deriveFrom"] == "SETTLED_GROUP_RESPONSE" for beat in document["beats"]):
         window_count = 10
         settled_window = None
@@ -778,7 +1024,11 @@ def _simulate_bottles(scene, created, document):
                 settled_window = window
                 break
         if settled_window is None:
-            raise PhysicsActionError("PHYSICS_SETTLE", "no derived ten-frame group settle window")
+            complete_windows = [rows[index:index + window_count] for index in range(len(rows) - window_count + 1) if rows[index]["frame"] >= peak["frame"]]
+            best = min(complete_windows, key=lambda window: max(max(row["aggregateAngularStepDegrees"] for row in window) / .25, max(row["maximumTargetTranslationStepMeters"] for row in window) / .0015))
+            best_angular = max(row["aggregateAngularStepDegrees"] for row in best)
+            best_translation = max(row["maximumTargetTranslationStepMeters"] for row in best)
+            raise PhysicsActionError("PHYSICS_SETTLE", f"no derived ten-frame group settle window; best frames {best[0]['frame']}-{best[-1]['frame']} angular {best_angular:.8f} translation {best_translation:.8f}")
         result["settledWindowStartFrame"] = settled_window[0]["frame"]
         result["settledGroupFrame"] = settled_window[-1]["frame"]
         result["settledWindowFrameCount"] = len(settled_window)
@@ -797,6 +1047,30 @@ def _camera(name, frame, objects, direction_vector, occupancy):
     return light_build._camera(name, frame, center, objects, direction_vector, occupancy)
 
 
+def _secondary_readable_camera(scene, name, record_frame, readability_frame, objects, secondary, occupancy):
+    scene.frame_set(readability_frame)
+    center = _semantic_center(objects)
+    camera, _ = _camera(name, readability_frame, objects, (1, 0, -.32), occupancy)
+    candidates = []
+    for azimuth in range(0, 360, 45):
+        angle = math.radians(azimuth)
+        vector = (math.cos(angle), math.sin(angle), -.32)
+        camera.location = center - Vector(vector).normalized() * 5.0
+        direction._point_at(camera, center)
+        fit = direction._fit_camera(scene, camera, objects, occupancy, vector)
+        camera.data.dof.focus_distance = (center - camera.location).length
+        projected = {obj.name: world_to_camera_view(scene, camera, obj.matrix_world.translation) for obj in objects}
+        in_frame = all(point.z > 0 and 0 <= point.x <= 1 and 0 <= point.y <= 1 for point in projected.values())
+        cap_point = projected[secondary.name]
+        separation = min(math.hypot(cap_point.x - point.x, cap_point.y - point.y) for obj_name, point in projected.items() if obj_name != secondary.name)
+        candidates.append({"azimuthDegrees": azimuth, "direction": [round(value, 8) for value in vector], "allSemanticCentersInFrame": in_frame, "minimumSecondaryCenterSeparationNormalized": round(separation, 8), "_matrix": camera.matrix_world.copy(), "_lens": camera.data.lens, "_focus": camera.data.dof.focus_distance, "_fit": fit})
+    selected = max(candidates, key=lambda row: (row["allSemanticCentersInFrame"], row["minimumSecondaryCenterSeparationNormalized"], -row["azimuthDegrees"]))
+    camera.matrix_world, camera.data.lens, camera.data.dof.focus_distance = selected["_matrix"], selected["_lens"], selected["_focus"]
+    evidence = {key: value for key, value in selected.items() if not key.startswith("_")}
+    evidence.update({"source": "BOUNDED_PROJECTED_SECONDARY_READABILITY", "readabilityFrame": readability_frame, "recordFrame": record_frame, "candidateCount": len(candidates), "candidateCameraObjectCount": 1, "candidateCameraObjectDeletions": 0, "losingCandidateCameraObjectsRetained": 0, "candidates": [{key: value for key, value in row.items() if not key.startswith("_")} for row in candidates]})
+    return camera, {**selected["_fit"], "secondaryReadability": evidence}
+
+
 def _configure_cameras(scene, created, physics, document, topology):
     start, end = scene.frame_start, scene.frame_end
     offset = next(beat["offsetFrames"] for beat in document["beats"] if beat["id"] == "cause")
@@ -809,11 +1083,12 @@ def _configure_cameras(scene, created, physics, document, topology):
     else:
         effect_frame = min(end, physics.get("peakGroupResponseFrame", physics.get("peakOpenFrame", contact_frame + 12)))
     actor, targets = created["actor"], created["targets"]
+    secondary = created.get("secondary", [])
     physical_environment = created.get("physicalLook", {}).get("environment")
     close_physical_staging = bool(physical_environment and physical_environment.get("preset") == "AGED_MAPLE_COURT_WITH_SCALE_CUES")
     cause_objects = [actor, *targets] if close_physical_staging else [actor, created.get("ramp", created.get("floor")), *targets]
-    contact_objects = [actor, *targets]
-    effect_objects = [*targets] if effect_beat["deriveFrom"] == "SETTLED_GROUP_RESPONSE" else [*targets, actor]
+    contact_objects = [actor, *targets, *secondary]
+    effect_objects = [*targets, *secondary] if effect_beat["deriveFrom"] == "SETTLED_GROUP_RESPONSE" else [*targets, *secondary, actor]
     if topology == "HINGE_LIGHT":
         effect_objects.insert(0, created["receiver"])
     directions = ((1, .78, -.48), (.9, 1, -.25), (1, .12, -.55))
@@ -830,7 +1105,12 @@ def _configure_cameras(scene, created, physics, document, topology):
     ):
         scene.frame_set(frame)
         bpy.context.view_layer.update()
-        camera, fit = _camera(f"ACTION_CAM_{role.upper()}", frame, [obj for obj in objects if obj], vector, occupancy)
+        objects = [obj for obj in objects if obj]
+        if secondary and role in {"contact", "effect"} and physics.get("breakableAttachment", {}).get("detachmentFrame") is not None:
+            readability_frame = min(end, physics["breakableAttachment"]["detachmentFrame"] + 2) if role == "contact" else frame
+            camera, fit = _secondary_readable_camera(scene, f"ACTION_CAM_{role.upper()}", frame, readability_frame, objects, secondary[0], occupancy)
+        else:
+            camera, fit = _camera(f"ACTION_CAM_{role.upper()}", frame, objects, vector, occupancy)
         marker = scene.timeline_markers.new(f"ACTION_{role.upper()}", frame=frame)
         marker.camera = camera
         records[role], cameras[role] = {"frame": frame, "camera": camera.name, **fit}, camera
@@ -841,7 +1121,7 @@ def _configure_cameras(scene, created, physics, document, topology):
     for frame in (measurement_frame - 1, measurement_frame):
         scene.frame_set(frame)
         bpy.context.view_layer.update()
-        projected[frame] = {obj.name: world_to_camera_view(scene, camera, obj.matrix_world.translation) for obj in [actor, *targets]}
+        projected[frame] = {obj.name: world_to_camera_view(scene, camera, obj.matrix_world.translation) for obj in [actor, *targets, *secondary]}
     width, height = document["cinematography"]["reviewResolution"]
     speeds = {name: math.hypot((projected[measurement_frame][name].x - projected[measurement_frame - 1][name].x) * width, (projected[measurement_frame][name].y - projected[measurement_frame - 1][name].y) * height) for name in projected[measurement_frame]}
     moving = [value for value in speeds.values() if value > 1e-8]
@@ -885,12 +1165,20 @@ def execute_physics_action(repository_root, spec_uri, inspection_token, scene=No
     scene.frame_set(scene.frame_start)
     bpy.context.view_layer.update()
     release = min(node["initialCondition"].get("releaseFrame", scene.frame_start) for node in document["nodes"] if node.get("rigidBody", {}).get("type") == "ACTIVE")
-    dynamic = [created["actor"], *created["targets"]]
+    dynamic = [created["actor"], *created["targets"], *created.get("secondary", [])]
     light_channels = sum(0 if not lamp.data.animation_data or not lamp.data.animation_data.action else len(lamp.data.animation_data.action.fcurves) for lamp in created["lights"])
     result = {
-        "schemaVersion": RESULT_VERSION,
+        "schemaVersion": {
+            SPEC_VERSION: RESULT_VERSION,
+            BREAKABLE_SPEC_VERSION: BREAKABLE_RESULT_VERSION,
+            DERIVED_TARGET_SPEC_VERSION: DERIVED_TARGET_RESULT_VERSION,
+        }[document["schemaVersion"]],
         "status": "PASS_EXECUTED",
-        "contractVersion": CONTRACT_VERSION,
+        "contractVersion": {
+            SPEC_VERSION: CONTRACT_VERSION,
+            BREAKABLE_SPEC_VERSION: BREAKABLE_CONTRACT_VERSION,
+            DERIVED_TARGET_SPEC_VERSION: DERIVED_TARGET_CONTRACT_VERSION,
+        }[document["schemaVersion"]],
         "sceneId": document["projectId"],
         "sceneSpecHash": document["physicsActionSpecHash"],
         "sceneSpecFileSha256": file_hash,
@@ -928,6 +1216,21 @@ def execute_physics_action(repository_root, spec_uri, inspection_token, scene=No
             "contactClipFrameRangeInclusive": [max(scene.frame_start, physics["contactFrame"] - 12), min(scene.frame_end, physics["contactFrame"] + 35)],
         },
     }
+    if document["schemaVersion"] in {BREAKABLE_SPEC_VERSION, DERIVED_TARGET_SPEC_VERSION}:
+        result["authority"].update({
+            "authoredBreakFrames": 0,
+            "authoredDetachedPoses": 0,
+            "authoredDetachmentVelocities": 0,
+        })
+        result["mechanism"].update({
+            "breakableFixedConstraintCount": 1,
+            "constraintBreakSource": "BLENDER_BULLET_IMPULSE_THRESHOLD",
+        })
+        if created.get("attachmentTargetDerivation") is not None:
+            result["mechanism"]["attachmentTargetDerivation"] = created["attachmentTargetDerivation"]
+        if created.get("contactGeometry") is not None:
+            result["mechanism"]["contactGeometry"] = created["contactGeometry"]
+        result["semanticRoster"]["secondary"] = [obj.name for obj in created.get("secondary", [])]
     if "derivedPhysicalArchetypes" in created:
         result["physicalArchetypes"] = created["derivedPhysicalArchetypes"]
     if topology_name == "HINGE_LIGHT":
