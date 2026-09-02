@@ -24,6 +24,9 @@ SNAPSHOT_VERSION = "bfs.fluidStateSnapshot.v0.1"
 STATE_VERSION = "bfs.fluidIterationState.v0.1"
 PLAN_VERSION = "bfs.fluidIterationPlan.v0.1"
 REVIEW_RECEIPT_VERSION = "bfs.fluidReviewReceipt.v0.1"
+OBSERVATION_VERSION = "bfs.fluidTierObservation.v0.1"
+OBSERVATION_ESCALATION_REQUEST_VERSION = "bfs.fluidObservationEscalationRequest.v0.1"
+OBSERVATION_ESCALATION_DECISION_VERSION = "bfs.fluidObservationEscalationDecision.v0.1"
 
 QUALITY_TIERS = {
     "DRAFT": {"resolutionMax": 64, "maximumFrameCount": 12},
@@ -31,6 +34,8 @@ QUALITY_TIERS = {
     "REVIEW": {"resolutionMax": 128, "maximumFrameCount": 48},
     "FINAL": {"resolutionMax": 192, "maximumFrameCount": 240},
 }
+
+_TIER_ORDER = tuple(QUALITY_TIERS)
 
 _BANNED_SNAPSHOT_KEYS = {
     "qualityTier",
@@ -194,6 +199,131 @@ def _validate_review_receipt(receipt, signatures, snapshot):
         raise FluidPipelineError("PHYSICS_CHANGED_AFTER_REVIEW", "physics identity")
     if receipt["surfaceSignature"] != signatures["surfaceSignature"]:
         raise FluidPipelineError("SURFACE_CHANGED_AFTER_REVIEW", "surface identity")
+
+
+def _validate_tier_observation(observation, expected_statuses, label):
+    _exact(observation, {
+        "schemaVersion", "status", "tier", "resolutionMax",
+        "physicsIdentityHash", "metricId", "threshold", "value",
+        "changedParameters", "evidenceHash", "observationHash",
+    }, label)
+    if observation["schemaVersion"] != OBSERVATION_VERSION:
+        raise FluidPipelineError("SPEC_VERSION", label)
+    if observation["status"] not in expected_statuses:
+        raise FluidPipelineError("OBSERVATION_STATUS", label)
+    tier = observation["tier"]
+    if tier not in QUALITY_TIERS:
+        raise FluidPipelineError("UNKNOWN_TIER", str(tier))
+    if observation["resolutionMax"] != QUALITY_TIERS[tier]["resolutionMax"]:
+        raise FluidPipelineError("TIER_RESOLUTION_MISMATCH", label)
+    _hex(observation["physicsIdentityHash"], "physicsIdentityHash")
+    _hex(observation["evidenceHash"], "evidenceHash")
+    if not isinstance(observation["metricId"], str) or not observation["metricId"]:
+        raise FluidPipelineError("SPEC_SCHEMA", f"{label}.metricId")
+    for field in ("threshold", "value"):
+        value = observation[field]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise FluidPipelineError("NONFINITE_NUMBER", f"{label}.{field}")
+    changed = observation["changedParameters"]
+    if not isinstance(changed, list) or any(not isinstance(value, str) or not value for value in changed):
+        raise FluidPipelineError("SPEC_SCHEMA", f"{label}.changedParameters")
+    if len(changed) != len(set(changed)) or changed != sorted(changed):
+        raise FluidPipelineError("CHANGED_PARAMETER_ROSTER", label)
+    if observation["observationHash"] != _self_hash(observation, "observationHash"):
+        raise FluidPipelineError("STALE_OBSERVATION", label)
+
+
+def seal_tier_observation(status, tier, physics_identity_hash, metric_id, threshold, value, changed_parameters, evidence_hash):
+    """Create one product-owned, self-hashed liquid metric observation."""
+
+    if tier not in QUALITY_TIERS:
+        raise FluidPipelineError("UNKNOWN_TIER", str(tier))
+    if status not in {"DEFECT_ACCEPTED", "CONTAINED", "DEFECT_OBSERVED"}:
+        raise FluidPipelineError("OBSERVATION_STATUS", str(status))
+    observation = {
+        "schemaVersion": OBSERVATION_VERSION,
+        "status": status,
+        "tier": tier,
+        "resolutionMax": QUALITY_TIERS[tier]["resolutionMax"],
+        "physicsIdentityHash": physics_identity_hash,
+        "metricId": metric_id,
+        "threshold": threshold,
+        "value": value,
+        "changedParameters": changed_parameters,
+        "evidenceHash": evidence_hash,
+    }
+    observation["observationHash"] = _self_hash(observation, "observationHash")
+    _validate_tier_observation(observation, {status}, "observation")
+    if status == "DEFECT_ACCEPTED":
+        if changed_parameters or value <= threshold:
+            raise FluidPipelineError("DEFECT_THRESHOLD_MISMATCH", "observation")
+    else:
+        if len(changed_parameters) != 1:
+            raise FluidPipelineError("CHANGED_PARAMETER_ROSTER", "observation")
+        if (value <= threshold) != (status == "CONTAINED"):
+            raise FluidPipelineError("OBSERVATION_STATUS_MISMATCH", "observation")
+    return observation
+
+
+def evaluate_observation_escalation(request):
+    """Classify one candidate against an accepted higher- or same-tier defect.
+
+    This function never clears the accepted defect.  It only selects the
+    smallest next validation step from product-observed, self-hashed evidence.
+    """
+
+    _exact(request, {"schemaVersion", "acceptedDefect", "candidateObservation"}, "observationEscalationRequest")
+    if request["schemaVersion"] != OBSERVATION_ESCALATION_REQUEST_VERSION:
+        raise FluidPipelineError("SPEC_VERSION", "observationEscalationRequest")
+    defect = request["acceptedDefect"]
+    candidate = request["candidateObservation"]
+    _validate_tier_observation(defect, {"DEFECT_ACCEPTED"}, "acceptedDefect")
+    _validate_tier_observation(candidate, {"CONTAINED", "DEFECT_OBSERVED"}, "candidateObservation")
+    if defect["changedParameters"]:
+        raise FluidPipelineError("CHANGED_PARAMETER_ROSTER", "acceptedDefect")
+    if len(candidate["changedParameters"]) != 1:
+        raise FluidPipelineError("CHANGED_PARAMETER_ROSTER", "candidateObservation")
+    if defect["physicsIdentityHash"] != candidate["physicsIdentityHash"]:
+        raise FluidPipelineError("PHYSICS_IDENTITY_MISMATCH", "candidateObservation")
+    if defect["metricId"] != candidate["metricId"]:
+        raise FluidPipelineError("METRIC_MISMATCH", "candidateObservation")
+    if defect["threshold"] != candidate["threshold"]:
+        raise FluidPipelineError("THRESHOLD_MISMATCH", "candidateObservation")
+    if defect["value"] <= defect["threshold"]:
+        raise FluidPipelineError("DEFECT_THRESHOLD_MISMATCH", "acceptedDefect")
+    candidate_contained = candidate["value"] <= candidate["threshold"]
+    if candidate_contained != (candidate["status"] == "CONTAINED"):
+        raise FluidPipelineError("OBSERVATION_STATUS_MISMATCH", "candidateObservation")
+
+    defect_index = _TIER_ORDER.index(defect["tier"])
+    candidate_index = _TIER_ORDER.index(candidate["tier"])
+    if candidate_index > defect_index:
+        raise FluidPipelineError("CANDIDATE_TIER_ABOVE_DEFECT", "candidateObservation")
+    if candidate_index < defect_index:
+        status = "INCONCLUSIVE_LOWER_TIER_CONTAINED" if candidate_contained else "DEFECT_REPRODUCED_LOWER_TIER"
+        next_action = "RUN_SAME_TIER_SINGLE_VARIABLE_PROBE"
+        next_tier = defect["tier"]
+    elif candidate_contained:
+        status = "CANDIDATE_SAME_TIER_SIGNAL"
+        next_action = "VERIFY_NEXT_DEPENDENT_STAGE"
+        next_tier = defect["tier"]
+    else:
+        status = "DEFECT_REPRODUCED"
+        next_action = "AUDIT_CAUSAL_INPUTS"
+        next_tier = defect["tier"]
+
+    decision = {
+        "schemaVersion": OBSERVATION_ESCALATION_DECISION_VERSION,
+        "status": status,
+        "acceptedDefectHash": defect["observationHash"],
+        "candidateObservationHash": candidate["observationHash"],
+        "changedParameter": candidate["changedParameters"][0],
+        "nextTier": next_tier,
+        "nextAction": next_action,
+        "clearsAcceptedDefect": False,
+    }
+    decision["decisionHash"] = _self_hash(decision, "decisionHash")
+    return decision
 
 
 def compile_iteration_plan(request):
